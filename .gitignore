@@ -1,0 +1,9 @@
+build/
+sdkconfig
+sdkconfig.old
+secrets/secrets.h
+factory/*.bin
+.DS_Store
+.cache/
+managed_components/
+dependencies.lock

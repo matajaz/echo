@@ -1,0 +1,8 @@
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+# Plain HTTP to our own LAN nginx (debian.local:8091), same trust model as
+# lumen/Vegena -- no TLS cert to manage on a home LAN. The URL-prefix
+# allowlist in ota.c (ota_url_allowed) is the actual SSRF/arbitrary-firmware
+# guard; this flag only lifts esp_https_ota's blanket http-is-unverified gate.
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y

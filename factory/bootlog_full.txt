@@ -1,0 +1,166 @@
+I (414) esp_image: segment 1: paddr=002926c4 vaddr=40800000 sizeESP-ROM:esp32c5-eco3-20250704
+Build:Jul  4 2025
+rst:0x15 (USB_UART_HPSYS),boot:0x70 (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x408556b0,len:0x1810
+load:0x4084bba0,len:0xfc4
+load:0x4084e5a0,len:0x3264
+entry 0x4084bbaa
+I (21) boot: ESP-IDF v5.5.4 2nd stage bootloader
+I (21) boot: compile time Jul  1 2026 13:58:27
+I (22) boot: chip revision: v1.2
+I (22) boot: efuse block revision: v0.3
+I (23) qio_mode: Enabling default flash chip QIO
+I (23) boot.esp32c5: SPI Speed      : 80MHz
+I (24) boot.esp32c5: SPI Mode       : QIO
+I (24) boot.esp32c5: SPI Flash Size : 16MB
+I (24) boot: Enabling RNG early entropy source...
+I (25) boot: Partition Table:
+I (25) boot: ## Label            Usage          Type ST Offset   Length
+I (26) boot:  0 nvs              WiFi data        01 02 00009000 00004000
+I (27) boot:  1 otadata          OTA data         01 00 0000d000 00002000
+I (27) boot:  2 phy_init         RF data          01 01 0000f000 00001000
+I (28) boot:  3 factory          factory app      00 00 00020000 004e2000
+I (29) boot:  4 storage          Unknown data     01 82 00502000 00400000
+I (30) boot:  5 ota_0            OTA app          00 10 00910000 00300000
+I (30) boot:  6 assets           Unknown data     01 82 00c10000 00300000
+I (31) boot: End of partition table
+I (32) boot: Defaulting to factory image
+I (32) esp_image: segment 0: paddr=00020020 vaddr=42240020 size=27269ch (2565788) map
+I (414) esp_image: segment 1: paddr=002926c4 vaddr=40800000 size=0d954h ( 55636) load
+I (424) esp_image: segment 2: paddr=002a0020 vaddr=42000020 size=235c60h (2317408) map
+I (768) esp_image: segment 3: paddr=004d5c88 vaddr=4080d954 size=0f140h ( 61760) load
+I (780) esp_image: segment 4: paddr=004e4dd0 vaddr=4081cb00 size=06370h ( 25456) load
+I (792) boot: Loaded app from partition at offset 0x20000
+I (793) boot: Disabling RNG early entropy source...
+I (794) MSPI Timing: Enter flash timing tuning
+I (795) MSPI Timing: Enter psram timing tuning
+I esp_psram: Found 8MB PSRAM device
+I esp_psram: Speed: 80MHz
+I (1129) mmu_psram: .rodata xip on psram
+I (1428) mmu_psram: .text xip on psram
+I (1428) cpu_start: Unicore app
+I (1852) esp_psram: SPI SRAM memory test OK
+I (1861) cpu_start: GPIO 12 and 11 are used as console UART I/O pins
+I (1861) cpu_start: Pro cpu start user code
+I (1861) cpu_start: cpu freq: 240000000 Hz
+I (1862) app_init: Application information:
+I (1862) app_init: Project name:     01_factory
+I (1862) app_init: App version:      1
+I (1862) app_init: Compile time:     Jul  1 2026 13:56:52
+I (1863) app_init: ELF file SHA256:  ebee0cda3...
+I (1863) app_init: ESP-IDF:          v5.5.4
+I (1863) efuse_init: Min chip rev:     v1.0
+I (1863) efuse_init: Max chip rev:     v1.99 
+I (1864) efuse_init: Chip rev:         v1.2
+I (1864) heap_init: Initializing. RAM available for dynamic allocation:
+I (1864) heap_init: At 4082AEF0 len 000316B0 (197 KiB): RAM
+I (1865) heap_init: At 4085C5A0 len 00002F58 (11 KiB): RAM
+I (1865) heap_init: At 50000000 len 00003FE8 (15 KiB): RTCRAM
+I (1865) esp_psram: Adding pool of 3328K of PSRAM memory to heap allocator
+I (1866) esp_psram: Adding pool of 40K of PSRAM memory gap generated due to end address alignment of irom to the heap allocator
+I (1866) esp_psram: Adding pool of 54K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator
+I (1868) spi_flash: detected chip: generic
+I (1868) spi_flash: flash io: qio
+W (1868) spi_flash: Detected size(32768k) larger than the size in the binary image header(16384k). Using the size in the binary image header.
+W (1869) spi_flash: CPU frequency is set to 240MHz. esp_flash_write_encrypted() will automatically limit CPU frequency to 160MHz during execution.
+I (1870) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (1870) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (1871) main_task: Started on CPU0
+I (1871) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (1871) main_task: Calling app_main()
+I (1881) wifi_manager: wifi_manager initialized
+I (1881) wifi_manager: Callback registered (1 total)
+I (1882) pp: pp rom version: b025441
+I (1882) net80211: net80211 rom version: b025441
+I (1883) wifi:wifi driver task: 40838464, prio:23, stack:6656, core=0
+I (1887) wifi:wifi firmware version: 0947e8b
+I (1888) wifi:wifi certification version: v7.0
+I (1888) wifi:config NVS flash: enabled
+I (1888) wifi:config nano formatting: disabled
+I (1888) wifi:mac_version:HAL_MAC_ESP32AX_752MP_ECO2,ut_version:N, band mode:0x3
+I (1889) wifi:Init data frame dynamic rx buffer num: 32
+I (1889) wifi:Init static rx mgmt buffer num: 5
+I (1889) wifi:Init management short buffer num: 32
+I (1889) wifi:Init static tx buffer num: 16
+I (1889) wifi:Init static tx FG buffer num: 2
+I (1889) wifi:Init static rx buffer size: 1700 (rxctrl:64, csi:512)
+I (1890) wifi:Init static rx buffer num: 16
+I (1890) wifi:Init dynamic rx buffer num: 32
+I (1891) wifi_init: rx ba win: 16
+I (1891) wifi_init: accept mbox: 6
+I (1891) wifi_init: tcpip mbox: 32
+I (1891) wifi_init: udp mbox: 6
+I (1891) wifi_init: tcp mbox: 6
+I (1891) wifi_init: tcp tx win: 5760
+I (1891) wifi_init: tcp rx win: 5760
+I (1891) wifi_init: tcp mss: 1440
+I (1892) wifi_init: WiFi IRAM OP enabled
+I (1892) wifi_init: WiFi RX IRAM OP enabled
+I (1892) wifi_init: WiFi SLP IRAM OP enabled
+I (1893) phy_init: phy_version 108,cdfe9643,Dec  2 2025,11:38:11
+W (2469) wifi:WDEV_RXCCK_DELAY:960
+W (2469) wifi:WDEV_RXOFDM_DELAY:266
+W (2469) wifi:WDEV_RX_11G_OFDM_DELAY:267
+W (2469) wifi:WDEV_TXCCK_DELAY:630
+W (2469) wifi:WDEV_TXOFDM_DELAY:94
+W (2470) wifi:ACK_TAB0   :0x   90a0b, QAM16:0x9 (24Mbps), QPSK:0xa (12Mbps), BPSK:0xb (6Mbps)
+W (2470) wifi:CTS_TAB0   :0x   90a0b, QAM16:0x9 (24Mbps), QPSK:0xa (12Mbps), BPSK:0xb (6Mbps)
+W (2471) wifi:WDEVBEAMFORMCONF:0x61d7120, HE_BF_RPT_RA_SET_OPT:1
+W (2471) wifi:WDEVVHTBEAMFORMCONF: 0x61d7120, WDEV_VHT_BEAMFORMEE_ENA: 1, WDEV_VHT_NG_SEL: 0
+W (2471) wifi:(agc)0x600a7128:0xd217e800, min.avgNF:0xce->0xd2(dB), RCalCount:0x17e, min.RRssi:0x800(-128.00)
+W (2472) wifi:MODEM_SYSCON_WIFI_BB_CFG_REG(0x600a9c18):0x10003802
+W (2472) wifi:(phy)rate:0x0(  LP-1Mbps), pwr:20, txing:20
+W (2473) wifi:(phy)rate:0x1(  LP-2Mbps), pwr:20, txing:20
+W (2473) wifi:(phy)rate:0x2(LP-5.5Mbps), pwr:20, txing:20
+W (2473) wifi:(phy)rate:0x3( LP-11Mbps), pwr:20, txing:20
+W (2473) wifi:(phy)rate:0x5(  SP-2Mbps), pwr:20, txing:20
+W (2474) wifi:(phy)rate:0x6(SP-5.5Mbps), pwr:20, txing:20
+W (2474) wifi:(phy)rate:0x7( SP-11Mbps), pwr:20, txing:20
+W (2474) wifi:(phy)rate:0x8(    48Mbps), pwr:17, txing:17
+W (2474) wifi:(phy)rate:0x9(    24Mbps), pwr:19, txing:19
+W (2475) wifi:(phy)rate:0xa(    12Mbps), pwr:19, txing:19
+W (2475) wifi:(phy)rate:0xb(     6Mbps), pwr:19, txing:19
+W (2475) wifi:(phy)rate:0xc(    54Mbps), pwr:17, txing:17
+W (2476) wifi:(phy)rate:0xd(    36Mbps), pwr:19, txing:19
+W (2476) wifi:(phy)rate:0xe(    18Mbps), pwr:19, txing:19
+W (2476) wifi:(phy)rate:0xf(     9Mbps), pwr:19, txing:19
+W (2477) wifi:(phy)rate:0x10, mcs:0x0, pwr(bw20:19, bw40:18), txing:19, HE pwr(bw20:19), txing:19
+W (2477) wifi:(phy)rate:0x11, mcs:0x1, pwr(bw20:19, bw40:18), txing:19, HE pwr(bw20:19), txing:19
+W (2478) wifi:(phy)rate:0x12, mcs:0x2, pwr(bw20:18, bw40:17), txing:18, HE pwr(bw20:18), txing:18
+W (2478) wifi:(phy)rate:0x13, mcs:0x3, pwr(bw20:18, bw40:17), txing:18, HE pwr(bw20:18), txing:18
+W (2479) wifi:(phy)rate:0x14, mcs:0x4, pwr(bw20:17, bw40:16), txing:17, HE pwr(bw20:17), txing:17
+W (2479) wifi:(phy)rate:0x15, mcs:0x5, pwr(bw20:17, bw40:16), txing:17, HE pwr(bw20:17), txing:17
+W (2480) wifi:(phy)rate:0x16, mcs:0x6, pwr(bw20:17, bw40:16), txing:17, HE pwr(bw20:17), txing:17
+W (2480) wifi:(phy)rate:0x17, mcs:0x7, pwr(bw20:17, bw40:16), txing:17, HE pwr(bw20:17), txing:17
+W (2481) wifi:(phy)rate:0x18, mcs:0x8, pwr(bw20:19, bw40:16), txing:19, HE pwr(bw20:16), txing:16
+W (2481) wifi:(phy)rate:0x19, mcs:0x9, pwr(bw20:18, bw40:16), txing:18, HE pwr(bw20:15), txing:15
+W (2482) wifi:(hal)co_hosted_bss:0, max_indicator:0, bitmask:0xff, mBSSIDsEnable:0
+I (2482) wifi:11ax coex: WDEVAX_PTI0(0x55777555), WDEVAX_PTI1(0x00003377).
+
+I (2483) wifi:mode : sta (10:bd:a3:df:29:fc)
+I (2483) wifi:enable tsf
+W (2483) wifi:(BB)enable busy check(0x18), disable idle check(0xaa)
+I (2485) wifi_manager: STA started, connecting to: weather-wifi
+I (2486) ESP32-C5-Touch-LCD-2.8: CH32V003 IO expander init success
+I (2717) ESP32-C5-Touch-LCD-2.8: Partition size: total: 3848081, used: 201553
+W (2717) ESP32-C5-Touch-LCD-2.8: Warning: Long filenames on SD card are disabled in menuconfig!
+E (2739) vfs_fat_sdmmc: sdmmc_card_init failed (0x107).
+E (2740) ESP32-C5-Touch-LCD-2.8: bsp_sdcard_sdspi_mount(193): SD card SPI mount failed
+W (2740) Main: [main.cpp:0112](app_main): SD card mount failed: ESP_ERR_TIMEOUT
+I (2740) Main: [main.cpp:0115](app_main): Display ESP-Brookesia phone demo
+I (2741) esp_lvgl:adapter: LVGL adapter initialized successfully
+I (3264) ESP32-C5-Touch-LCD-2.8: Touch config: rst_gpio_num=-1, GPIO_NUM_NC=-1
+I (3264) CST3530 transfer parameters: esp_lcd_panel_io_handle_t io
+I (3264) CST3530: Touch driver config: rst_gpio_num=-1, GPIO_NUM_NC=-1
+I (3301) esp_lvgl:adapter: LVGL task started successfully
+I (3303) ESP32-C5-Touch-LCD-2.8: Backlight: 100%
+W (3303) BS:Core: [esp_brookesia_base_context.cpp:0051](getDisplaySize): Display is not set, use default display
+I (3305) BS:Core: [esp_brookesia_base_context.cpp:0189](begin): Library version: 0.6.0
+W (3370) BS:Phone: [esp_brookesia_phone_manager.cpp:0064](begin): No touch device is set, try to use default touch device
+W (3371) BS:Phone: [esp_brookesia_phone_manager.cpp:0068](begin): Using default touch device(@0x0x424bedc4)
+I (3403) QMI8658: QMI8658 initialized successfully
+E (3404) gpio: gpio_install_isr_service(537): GPIO isr service already installed
+I (3559) main_task: Returned from app_main()
+W (12132) wifi_manager: Retrying... (1/3)
+W (12132) system_manage_service: WiFi disconnected
