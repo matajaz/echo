@@ -1,6 +1,22 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-otadata,  data, ota,     0xf000,  0x2000,
-phy_init, data, phy,     0x11000, 0x1000,
-ota_0,    app,  ota_0,   0x20000, 0x180000,
-ota_1,    app,  ota_1,   ,        0x180000,
+# echo partition table -- 32 MB flash (ESP32-C5, confirmed via esptool
+# flash_id; the factory image header under-reported 16 MB).
+#
+# OTA app slots grown from 0x180000 (1.5 MB) to 0x300000 (3 MB) each on
+# 2026-10-02: the LVGL build already reached 1.44 MB (9% free in the old
+# 1.5 MB slot), and the still-to-come audio layer (ES8311 + esp_codec_dev)
+# is sizable. 3 MB slots leave ~50% headroom. App partitions MUST stay
+# 0x10000-aligned. Growing a slot the running image lives in cannot be
+# done over OTA -- this change requires a USB reflash of the whole table
+# (done while the board is connected to hp.local).
+#
+# A 1 MB "storage" data partition is added for future on-device assets
+# (fonts, images, SPIFFS/LittleFS logs) -- cheap given 32 MB total and
+# avoids another repartition+USB-reflash later.
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x300000,
+ota_1,    app,  ota_1,   0x320000, 0x300000,
+storage,  data, spiffs,  0x620000, 0x100000,

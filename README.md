@@ -142,4 +142,170 @@ OTA server back up → confirmed via `GET /info` → `{"fw":"3",...}`.
 - [x] Capture factory boot log
 - [x] Back up full factory flash image
 - [x] Get OTA working (custom firmware, not stock xiaozhi app)
-- [ ] Decide project scope/direction (what should `echo` actually become?)
+- [x] Display bring-up (backlight + ST7789 panel, solid-color fill) --
+      see "Display bring-up" section below
+- [x] Touch (CST3530) -- see "Touch" below
+- [x] Observability: in-RAM `/log` + `/log.txt?since=` web log
+- [x] LVGL (esp_lvgl_port) with a 3-page swipeable tileview UI
+- [x] Sensors (QMI8658 IMU, SHTC3 temp/humidity, PCF85063A RTC) on the
+      shared I2C bus -- on screen, in graphs, and in `/metrics`
+- [x] Battery state-of-charge (CH32 expander ADC, calibrated)
+- [x] `/metrics` Prometheus endpoint (sensor + battery values)
+- [x] Audio (ES8311): clean boot tone + Happy Birthday melody +
+      volume buttons -- see "Audio" below (the crackle saga)
+- [x] Partition table grown to 3 MB OTA slots + 1 MB storage (USB-flashed)
+- [ ] Decide longer-term project scope/direction
+
+## Display bring-up (2026-10-02)
+
+Real hardware wiring, confirmed via `docs.waveshare.com/ESP32-C5-Touch-LCD-2.8`
+and the vendor's actual source repo
+(`github.com/waveshareteam/ESP32-C5-Touch-LCD-2.8`,
+`example/ESP-IDF-V554/08_bookesia`'s `components/esp32_c5_touch_lcd_2_8`) --
+not guessed, not ported from a different board size:
+
+- Panel: ST7789, SPI2. SCK=GPIO6, MOSI=GPIO7, DC=GPIO9, CS=GPIO10, 80MHz.
+- **LCD reset and backlight are NOT direct ESP32 GPIOs.** Both are driven
+  through the onboard **CH32V003 I/O-expander** chip over I2C (GPIO0=SDA,
+  GPIO1=SCL, shared bus with touch/IMU/RTC/audio), via the real managed
+  component `waveshare/custom_io_expander_ch32v003` (fixed I2C address
+  `0x24`). LCD_RST is `IO_EXPANDER_PIN_NUM_1`; backlight is set via the
+  expander's own PWM command (`custom_io_expander_set_pwm`), not an ESP32
+  LEDC channel.
+- ST7789 panel driver (`esp_lcd_new_panel_st7789`) ships with ESP-IDF's
+  own built-in `esp_lcd` component -- no separate managed component for
+  it is needed, despite the component name pattern suggesting otherwise.
+- `esp_lcd_panel_invert_color(panel, true)` is required for this exact
+  panel -- confirmed from vendor source, not optional.
+
+Implementation: `main/display.c` + `main/display.h` (`display_init()`,
+`display_fill(rgb565_color)`, `display_set_backlight(percent)`). Called
+non-fatally from `app_main.c` after the WiFi+OTA server is already up, so
+a display bug can never block the OTA recovery path.
+
+### The one real bug hit: RGB565 byte order
+
+`esp_lcd_panel_dev_config_t.data_endian`, left at its zero-initialized
+default (`LCD_RGB_DATA_ENDIAN_BIG`), writes a hardware register on the
+ST7789 panel itself telling it to expect MSB-first (big-endian) color
+bytes -- confirmed by reading the real driver source
+(`esp_lcd_panel_st7789.c`): this field is **not** a software byte-swap,
+it configures the panel chip's own `RAMCTL` register. A plain
+`uint16_t row_buf[x] = rgb565_color` store produces **little-endian**
+byte pairs in memory on this (or any) RISC-V/ESP32 chip, so every pixel
+arrived at the panel with its high/low byte swapped. A requested pure
+green fill (`0x07E0`) rendered as **red** on real hardware -- exactly
+what byte-swapping `0x07E0` -> `0xE007` produces (R=28/31, G=0, B=7/31).
+Fixed by explicitly setting `.data_endian = LCD_RGB_DATA_ENDIAN_LITTLE`
+to match how the buffer is actually filled. Confirmed fixed live
+(correct green after the fix).
+
+### Deployment note: a vendor-package build gap requires a manual patch
+
+`waveshare/custom_io_expander_ch32v003`'s own `CMakeLists.txt` declares
+`REQUIRES "driver"` (the pre-5.x umbrella driver component) but its
+public header includes `driver/i2c_master.h`, which current ESP-IDF
+(6.x) only provides via the split-out `esp_driver_i2c` component. This
+breaks the build immediately after any fresh dependency resolve
+(`rm -rf managed_components/` + `dependencies.lock`, or a clean clone).
+**Manual fix required every time:** edit
+`managed_components/waveshare__custom_io_expander_ch32v003/CMakeLists.txt`
+and change `REQUIRES "driver"` to `REQUIRES "driver" "esp_driver_i2c"`
+(documented in detail in `main/idf_component.yml`'s own comment, since
+`managed_components/` is gitignored and this patch does not persist).
+
+### Deployed via OTA (USB was unavailable this session)
+
+The USB passthrough chain (`hp.local` Proxmox -> `debian.local` VM ->
+`sandbox` container, documented above) was not working this session --
+the board wasn't visible in `lsusb` on either host, possibly related to
+the battery being added around the same time (worth checking the USB
+cable/power next time USB access is needed, e.g. for serial log viewing
+-- there is currently no log-over-HTTP endpoint on this device). All
+deployment this session went through the existing pull-OTA path instead
+(`/ota?key=...&url=...`), published to the same nginx host Vegena/lumen
+already use (`debian.local:8091`, `vegena-esp32-panel-web` container,
+`/home/mathias/vegena-ota/firmware/echo/echo.bin`).
+
+**OTA key**: `secrets/secrets.h`'s `OTA_KEY` now matches the shared
+workspace convention (`"vegena-ota"`, same as Vegena's real
+`OTA_PASSWORD` and lumen's documented deploy env) -- the file previously
+still had the unmodified example placeholder (`"changeme"`), which was
+what the device already running v4 actually had baked in from its
+original USB flash.
+
+## Audio (ES8311) — the crackle saga (2026-10-03)
+
+Audio output works (clean boot tone + a "Happy Birthday" melody triggered
+from an on-screen button, with volume up/down). Getting there took ~12
+failed attempts chasing the wrong causes, so the real root cause and the
+diagnostic method are documented here in detail.
+
+### Hardware wiring (verified against the vendor BSP, not guessed)
+- Codec: **ES8311** on the shared I2C bus (`ES8311_CODEC_DEFAULT_ADDR`).
+- I2S: SCLK=GPIO24, WS/LRCK=GPIO25, DOUT=GPIO26, DSIN=GPIO27, **MCLK=NC**
+  (not wired -- `use_mclk=false`, the ES8311 clocks off BCLK), I2S_NUM_0,
+  master, **16-bit MONO** slot (the esp_codec_dev driver maps our
+  `.channel=1` onto one active I2S slot -- do NOT switch to stereo; the
+  driver handles mono, confirmed in `managed_components/espressif__
+  esp_codec_dev/platform/audio_codec_data_i2s.c`).
+- Speaker PA enable: CH32 expander pin `IO_EXPANDER_PIN_NUM_3`
+  (`IO_POWER_AMP_IO`), active HIGH. The codec's own `pa_pin` is NC on this
+  board; the PA is enabled separately via the expander.
+- The vendor's `08_bookesia` BSP full-duplex pattern is matched: the I2S
+  channel is created with BOTH tx+rx handles and both are handed to
+  `audio_codec_new_i2s_data`.
+
+### The crackle: root cause was FOUR things, not one
+The "sparks/crackle" was NOT a single bug, which is why single-variable
+guesses never fully fixed it. Ruled out with evidence (don't re-chase
+these): hardware (factory firmware plays clean on the same speaker),
+amplitude/clipping (low amplitude crackles identically), DMA
+underrun/task-starvation (crackles even at task prio 20 with LVGL stopped
++ sensors paused), power (USB vs battery identical), mono-vs-stereo (tried,
+no difference), clock rate (measured playback wall-clock == expected
+duration, so I2S clocks at the right 16 kHz). The actual fixes, all in
+`main/audio.c`:
+1. **Per-note amplitude envelope** (10 ms raised-cosine fade in/out) --
+   the dominant source. A raw sine cut hard at each note edge clicks on
+   every note. This was the breakthrough (flagged by an external audio
+   analysis after many self-attempts missed it).
+2. **Drain before close** -- the I2S DMA buffer is deep (~256 ms); calling
+   `esp_codec_dev_close` right after the last write cut the tail
+   mid-sample and popped the PA. Write trailing silence + `vTaskDelay(300)`
+   so the DMA drains fully first.
+3. **Large generation chunk** (2048 samples = 128 ms/write, not 256) --
+   8x fewer write calls, far more generation headroom, killed the
+   remaining sporadic underruns. (2048 int16 is `static`, not on the
+   song task's 4 KB stack.)
+4. **Continuous phase accumulator across the whole melody** -- generating
+   each note from `sinf(w * pos)` with `pos` reset per note created a
+   phase discontinuity at note boundaries (a steady single tone was clean,
+   but the multi-note melody sparked at transitions). A running `phase +=
+   w` carried across notes (wrapped at 2*pi) + the envelope makes every
+   transition click-free.
+
+Deeper DMA buffers (`dma_desc_num=8, dma_frame_num=512`) and a high song-
+task priority are also set, as cheap insurance -- but they were NOT the
+fix (the crackle persisted with them alone). The song plays on its own
+FreeRTOS task so the ~8 s melody never blocks the LVGL event task; the
+screen stays live during playback.
+
+### The decisive diagnostic step
+What finally cracked it: **flashing the verified factory backup
+(`factory/factory_backup_esp32c5.bin`) over USB and confirming the factory
+firmware's audio is clean on the same speaker.** That one test proved the
+hardware was fine and the bug was 100% in our code -- which stopped the
+hardware/power rabbit-holes. The factory image is a full 32 MB raw dump;
+it can only be restored over USB (not OTA -- OTA writes only an app
+partition, and our partition table differs from factory). Re-flash echo
+over USB afterwards.
+
+## Audio / UI task-priority note (single-core ESP32-C5)
+The ESP32-C5 is **single-core** -- LVGL (prio 4), the sensor poll (3),
+WiFi, and the audio task all share one core. This did NOT turn out to be
+the audio crackle cause (see above), but it's a real constraint to keep in
+mind for any future continuous-realtime work: a long-running realtime task
+should run at a higher priority than LVGL, and heavy per-tick LVGL work
+(full-screen redraws, chart updates) is the thing most likely to starve a
+lower-priority task on this chip.
