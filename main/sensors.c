@@ -4,6 +4,7 @@
 
 #include "display.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"   // esp_rom_delay_us: tick-independent us delays
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -49,16 +50,45 @@ static uint8_t shtc3_crc8(const uint8_t *d, int n) {
 static esp_err_t shtc3_read_th_crc(i2c_master_dev_handle_t dev, float *t, float *h) {
     if (dev == NULL) return ESP_ERR_INVALID_STATE;
     uint8_t wake[2] = {0x35, 0x17};     // SHTC3_REG_WAKE
-    uint8_t meas[2] = {0x7C, 0xA2};     // SHTC3_REG_T_CSE_NM (T first, clock-stretch, normal)
+    uint8_t meas[2] = {0x78, 0x66};     // SHTC3_REG_T_CSD_NM (T first, clock-stretch DISABLED, normal)
     uint8_t sleep[2] = {0xB0, 0x98};    // SHTC3_REG_SLEEP
     uint8_t rx[6] = {0};
-    (void)i2c_master_transmit(dev, wake, 2, 100);
-    vTaskDelay(pdMS_TO_TICKS(1));       // ~240us wake-up
-    esp_err_t ret = i2c_master_transmit_receive(dev, meas, 2, rx, 6, 200);
+    esp_err_t wret = i2c_master_transmit(dev, wake, 2, 100);
+    if (wret != ESP_OK) {
+        ESP_LOGW(TAG, "SHTC3 wake failed: %s", esp_err_to_name(wret));
+        return wret;
+    }
+    // Tick-independent delays: FREERTOS_HZ=100 makes pdMS_TO_TICKS(1)==0
+    // and pdMS_TO_TICKS(15)==10ms, which is < the 12.1ms conversion -> the
+    // sensor NAKs the early read (ESP_ERR_INVALID_RESPONSE). Use us delays.
+    esp_rom_delay_us(300);              // >240us wake-up (SHTC3_WARMUP_US)
+    // Clock-stretch-DISABLED measurement: the write STARTS the conversion and
+    // the master must then WAIT it out and read the result separately. A single
+    // transmit_receive (the CSE pattern) returns all-zero data here because the
+    // sensor is not ready and this SoC's I2C controller does not hold SCL for
+    // the sensor's clock stretch.
+    esp_err_t ret = i2c_master_transmit(dev, meas, 2, 200);
+    if (ret == ESP_OK) {
+        esp_rom_delay_us(13000);        // >12.1ms max conversion (T first, normal)
+        ret = i2c_master_receive(dev, rx, 6, 200);
+    }
     (void)i2c_master_transmit(dev, sleep, 2, 100);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SHTC3 read failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    // An all-zero payload means the sensor returned NO measurement. Its CRC-8
+    // is also 0x00, so the CRC check below would PASS VACUOUSLY and report a
+    // bogus 0.0C / 0%RH as "valid". Reject it explicitly before the CRC test.
+    if (rx[0] == 0 && rx[1] == 0 && rx[3] == 0 && rx[4] == 0) {
+        ESP_LOGW(TAG, "SHTC3 all-zero read (raw %02x %02x %02x %02x %02x %02x)",
+                 rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     // Validate both CRC-8s (byte 2 covers rx[0..1], byte 5 covers rx[3..4]).
     if (shtc3_crc8(&rx[0], 2) != rx[2] || shtc3_crc8(&rx[3], 2) != rx[5]) {
+        ESP_LOGW(TAG, "SHTC3 CRC mismatch (raw %02x %02x %02x %02x %02x %02x)",
+                 rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
         return ESP_ERR_INVALID_CRC;
     }
     *t = ((((rx[0] * 256.0f) + rx[1]) * 175.0f) / 65535.0f) - 45.0f;
