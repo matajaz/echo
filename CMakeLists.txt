@@ -15,6 +15,6 @@ if(DEFINED ENV{IDF_PATH})
     include_directories("$ENV{IDF_PATH}/components/esp_driver_i2c/include")
 endif()
 
-set(PROJECT_VER "116")
+set(PROJECT_VER "117")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(echo)

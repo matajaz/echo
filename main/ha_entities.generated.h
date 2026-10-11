@@ -29,7 +29,7 @@ static const ha_entity_def_t k_batt_entities[] = {
 };
 
 static const ha_power_def_t k_power_entities[] = {
-    { "sensor.nodered_84ed7654030307e4", "Sol", "W" },
+    { "sensor.solar_power", "Sol", "W" },
     { "sensor.tibber_pulse_blomsterkungsvagen_416_power", "Hus", "W" },
     { "sensor.sol_produktion_dag", "Sol idag", "kWh" },
 };

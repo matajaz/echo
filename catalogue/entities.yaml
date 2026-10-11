@@ -55,7 +55,7 @@ battery:
 # Power/energy tiles for the K01 Overview (A16). Values are W (live) or kWh
 # (energy today); the UI formats by index. entity_id form is the same.
 power:
-  - id: sensor.nodered_84ed7654030307e4
+  - id: sensor.solar_power
     name: Sol
     unit: W
   - id: sensor.tibber_pulse_blomsterkungsvagen_416_power

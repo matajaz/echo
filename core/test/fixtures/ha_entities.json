@@ -73,7 +73,7 @@
   ],
   "power": [
     {
-      "id": "sensor.nodered_84ed7654030307e4",
+      "id": "sensor.solar_power",
       "name": "Sol",
       "unit": "W"
     },
