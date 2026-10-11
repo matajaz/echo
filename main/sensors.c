@@ -4,6 +4,7 @@
 
 #include "display.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -28,13 +29,61 @@ void sensors_set_paused(bool paused) {
     s_paused = paused;
 }
 
+// --- SHTC3 CRC-validated read (#5b, 2026-10-10) ---------------------------
+// The vendor shtc3_get_th() reads all 6 bytes [T,T,crc, H,H,crc] but IGNORES
+// the two CRC bytes, so a corrupted I2C transfer is silently converted to a
+// bogus temperature/humidity. This does the measurement our-side and verifies
+// the Sensirion CRC-8 (polynomial 0x31, init 0xFF, no reflection) over each
+// 16-bit word before trusting it. Returns ESP_OK + T/H only if BOTH CRCs pass.
+static uint8_t shtc3_crc8(const uint8_t *d, int n) {
+    uint8_t crc = 0xFF;
+    for (int i = 0; i < n; i++) {
+        crc ^= d[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static esp_err_t shtc3_read_th_crc(i2c_master_dev_handle_t dev, float *t, float *h) {
+    if (dev == NULL) return ESP_ERR_INVALID_STATE;
+    uint8_t wake[2] = {0x35, 0x17};     // SHTC3_REG_WAKE
+    uint8_t meas[2] = {0x7C, 0xA2};     // SHTC3_REG_T_CSE_NM (T first, clock-stretch, normal)
+    uint8_t sleep[2] = {0xB0, 0x98};    // SHTC3_REG_SLEEP
+    uint8_t rx[6] = {0};
+    (void)i2c_master_transmit(dev, wake, 2, 100);
+    vTaskDelay(pdMS_TO_TICKS(1));       // ~240us wake-up
+    esp_err_t ret = i2c_master_transmit_receive(dev, meas, 2, rx, 6, 200);
+    (void)i2c_master_transmit(dev, sleep, 2, 100);
+    if (ret != ESP_OK) return ret;
+    // Validate both CRC-8s (byte 2 covers rx[0..1], byte 5 covers rx[3..4]).
+    if (shtc3_crc8(&rx[0], 2) != rx[2] || shtc3_crc8(&rx[3], 2) != rx[5]) {
+        return ESP_ERR_INVALID_CRC;
+    }
+    *t = ((((rx[0] * 256.0f) + rx[1]) * 175.0f) / 65535.0f) - 45.0f;
+    *h = (((rx[3] * 256.0f) + rx[4]) * 100.0f) / 65535.0f;
+    return ESP_OK;
+}
+
 // Try the QMI8658 at the high address first (0x6B, what the Waveshare
 // board uses), then the low address (0x6A) as a fallback. Returns true if
 // the IMU answered its WHO_AM_I at either address.
 static bool imu_bring_up(i2c_master_bus_handle_t bus) {
     const uint8_t addrs[] = {QMI8658_ADDRESS_HIGH, QMI8658_ADDRESS_LOW};
     for (size_t i = 0; i < sizeof(addrs); i++) {
+        // Start each attempt clean: a previous failed qmi8658_init may have
+        // registered an I2C device handle on the bus.
+        s_imu.dev_handle = NULL;
         if (qmi8658_init(&s_imu, bus, addrs[i]) != ESP_OK) {
+            // qmi8658_init adds the device to the bus BEFORE probing
+            // WHO_AM_I, so a failure after that point leaves the handle
+            // registered. Remove it, otherwise the retry below would
+            // overwrite (leak) the handle and leave a stale device on the bus.
+            if (s_imu.dev_handle != NULL) {
+                i2c_master_bus_rm_device(s_imu.dev_handle);
+                s_imu.dev_handle = NULL;
+            }
             continue;
         }
         uint8_t who = 0;
@@ -46,6 +95,10 @@ static bool imu_bring_up(i2c_master_bus_handle_t bus) {
             qmi8658_set_accel_unit_mps2(&s_imu, true);
             return true;
         }
+        // Init succeeded but the follow-up probe failed: tear the device
+        // down before trying the next address so it isn't leaked.
+        i2c_master_bus_rm_device(s_imu.dev_handle);
+        s_imu.dev_handle = NULL;
     }
     return false;
 }
@@ -64,42 +117,76 @@ static void poll_task(void *arg) {
         d = s_data; // start from last (keeps *_ok flags for failed sensors)
         xSemaphoreGive(s_mtx);
 
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000); // ms since boot
+
         if (d.imu_ok) {
             // Read into scratch and copy into d ONLY on success: on an I2C
             // NACK the driver may leave the out params untouched or garbage,
             // and d.imu_ok would still report 1. Leaving d at the last good
             // value is the honest answer.
             float ax, ay, az, gx, gy, gz, tmp;
+            bool accel_ok = false, gyro_ok = false;
             if (qmi8658_read_accel(&s_imu, &ax, &ay, &az) == ESP_OK) {
                 d.accel_x = ax;
                 d.accel_y = ay;
                 d.accel_z = az;
+                accel_ok = true;
             }
             if (qmi8658_read_gyro(&s_imu, &gx, &gy, &gz) == ESP_OK) {
                 d.gyro_x = gx;
                 d.gyro_y = gy;
                 d.gyro_z = gz;
+                gyro_ok = true;
             }
             if (qmi8658_read_temp(&s_imu, &tmp) == ESP_OK) {
-                d.imu_temp_c = tmp;
+                d.imu_temp_c = tmp;   // secondary; does NOT gate motion freshness
             }
+            // V05b: imu_last_ms gates the MOTION values (accel/gyro) the UI
+            // renders together. Refresh it only when BOTH motion reads
+            // succeeded this cycle — a die-temperature-only success must not
+            // make stale accel/gyro appear fresh (previously any-success did).
+            if (accel_ok && gyro_ok) d.imu_last_ms = now;
         }
         if (d.th_ok) {
             float t = 0, h = 0;
-            if (shtc3_get_th(s_shtc3, SHTC3_REG_T_CSE_NM, &t, &h) == ESP_OK) {
+            esp_err_t thr = shtc3_read_th_crc(s_shtc3, &t, &h);
+            if (thr == ESP_OK) {
                 d.temp_c = t;
                 d.humidity_rh = h;
+                d.th_last_ms = now;        // R10: fresh + CRC-valid
+            } else if (thr == ESP_ERR_INVALID_CRC) {
+                ESP_LOGW(TAG, "SHTC3 CRC mismatch — reading discarded");
+                // leave th_last_ms unchanged -> reads STALE via R10
             }
         }
         if (d.rtc_ok) {
             pcf85063a_datetime_t dt;
             if (pcf85063a_get_time_date(&s_rtc, &dt) == ESP_OK) {
-                d.year = dt.year;
-                d.month = dt.month;
-                d.day = dt.day;
-                d.hour = dt.hour;
-                d.min = dt.min;
-                d.sec = dt.sec;
+                // #5 (2026-10-10): check the oscillator-stop / clock-integrity
+                // bit. The PCF85063A seconds register (0x04) bit 7 (OS) is set
+                // when the oscillator has stopped (power loss / brown-out), i.e.
+                // the time is NOT trustworthy. The vendor driver MASKS it off
+                // (bufss[0] & 0x7F) and returns the bogus time as if valid. Read
+                // the raw register ourselves and only accept the time if OS==0.
+                uint8_t secreg = 0;
+                uint8_t reg = 0x04;  // PCF85063A_RTC_SECOND_ADDR
+                bool os_ok = false;
+                if (i2c_master_transmit_receive(s_rtc.dev_handle, &reg, 1,
+                                                &secreg, 1, 200) == ESP_OK) {
+                    os_ok = ((secreg & 0x80) == 0);   // OS=0 -> clock integrity good
+                }
+                if (os_ok) {
+                    d.year = dt.year;
+                    d.month = dt.month;
+                    d.day = dt.day;
+                    d.hour = dt.hour;
+                    d.min = dt.min;
+                    d.sec = dt.sec;
+                    d.rtc_last_ms = now;       // R10: fresh + trustworthy
+                } else {
+                    ESP_LOGW(TAG, "RTC oscillator-stop set (OS=1) — time untrusted");
+                    // leave rtc_last_ms unchanged -> reads STALE via R10
+                }
             }
         }
 
@@ -130,8 +217,11 @@ static void poll_task(void *arg) {
                 if (pct > 100) pct = 100;
                 d.bat_soc_pct = pct;
                 d.bat_ok = true;
+                d.bat_last_ms = now;       // R10
             }
         }
+
+        d.now_ms = now;  // R10: publish-time clock for age computation
 
         xSemaphoreTake(s_mtx, portMAX_DELAY);
         s_data = d;
@@ -175,9 +265,12 @@ esp_err_t sensors_init(void) {
     // Temp/humidity (SHTC3)
     s_shtc3 = shtc3_device_create(bus, SHTC3_I2C_ADDR, 400000);
     if (s_shtc3 != NULL) {
-        uint8_t id = 0;
-        if (shtc3_get_id(s_shtc3, &id) == ESP_OK) {
-            ESP_LOGI(TAG, "SHTC3 found (ID=0x%02x)", id);
+        // shtc3_get_id() writes TWO bytes (id[0] and id[1]) — the ID is 16-bit.
+        // A single uint8_t here overflowed the adjacent stack byte (R2, ASan
+        // stack-buffer-overflow, 2026-10-10). Give it the 2 bytes it writes.
+        uint8_t id[2] = {0};
+        if (shtc3_get_id(s_shtc3, id) == ESP_OK) {
+            ESP_LOGI(TAG, "SHTC3 found (ID=0x%02x%02x)", id[0], id[1]);
             d.th_ok = true;
         } else {
             ESP_LOGW(TAG, "SHTC3 ID read failed");
@@ -205,12 +298,16 @@ esp_err_t sensors_init(void) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     s_data = d;
     xSemaphoreGive(s_mtx);
-    s_started = true;
-
+    // #4 (2026-10-10): create the poll task BEFORE marking started. The initial
+    // one-shot readings above are already published, but if the poll task can't
+    // start the values will never refresh — so s_started must reflect worker
+    // liveness, not merely that init ran. (With the R10 freshness fields, a
+    // never-refreshing group also correctly reads STALE in the UI.)
     if (xTaskCreate(poll_task, "sensor_poll", 4096, NULL, 3, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to start sensor poll task");
-        // Not fatal -- init readings already captured above.
+        ESP_LOGE(TAG, "failed to start sensor poll task — sensors will not refresh");
+        return ESP_ERR_NO_MEM;   // caller logs degraded; s_started stays false
     }
+    s_started = true;
     ESP_LOGI(TAG, "sensors init done (imu=%d th=%d rtc=%d)", d.imu_ok, d.th_ok, d.rtc_ok);
     return ESP_OK;
 }
@@ -229,28 +326,62 @@ bool sensors_get(sensors_data_t *out) {
 // values. Each metric carries a HELP/TYPE line. Values from the mutex-
 // guarded snapshot; *_ok flags are exposed too so a scraper can tell a
 // real 0 from a missing sensor.
+// Render a float as a fixed-point decimal string without relying on the
+// C library's "%f" support. ESP-IDF's default newlib-nano printf is built
+// without float formatting unless explicitly enabled, so "%f"/"%.2f" would
+// silently emit empty or "nan" values in the /metrics response.
+static void fmt_fixed(char *out, size_t outsz, double v, int decimals) {
+    static const int scale[] = {1, 10, 100, 1000};
+    int sc = (decimals >= 0 && decimals <= 3) ? scale[decimals] : 1;
+    bool neg = v < 0;
+    double av = neg ? -v : v;
+    long long scaled = (long long)(av * (double)sc + 0.5);
+    long long ip = scaled / sc;
+    long long fp = scaled % sc;
+    if (decimals == 0) {
+        snprintf(out, outsz, "%s%lld", neg ? "-" : "", ip);
+    } else {
+        snprintf(out, outsz, "%s%lld.%0*lld", neg ? "-" : "", ip, decimals, fp);
+    }
+}
+
 static esp_err_t handle_metrics(httpd_req_t *req) {
     sensors_data_t d;
     bool ok = sensors_get(&d);
 
-    char body[1024];
+    // 2048 B: the full exposition is ~1 KB and was silently truncating the
+    // last (RTC) line at the old 1024 B cap (R9, 2026-10-10). Ample headroom
+    // now; the truncation flag below turns any future overflow into a loud
+    // 500 instead of a partial 200.
+    char body[2048];
     size_t n = 0;
+    bool truncated = false;
 
     // Bounded append. snprintf() returns the number of bytes it *would*
     // have written, so a naive `n += snprintf(...)` can push n past
     // sizeof(body) and make the next `sizeof(body) - n` underflow. Clamp
-    // to the last usable index (keeping room for the NUL) and stop.
+    // to the last usable index (keeping room for the NUL) and flag it.
     #define APPEND(...)                                                      \
         do {                                                                  \
             int _w = snprintf(body + n, sizeof(body) - n, __VA_ARGS__);       \
             if (_w < 0) {                                                    \
+                truncated = true;                                            \
                 break;                                                       \
             }                                                                 \
             if ((size_t)_w >= sizeof(body) - n) {                             \
                 n = sizeof(body) - 1;                                         \
+                truncated = true;                                            \
                 break;                                                       \
             }                                                                 \
             n += (size_t)_w;                                                  \
+        } while (0)
+
+    // Float gauge line without depending on printf "%f" support.
+    #define APPF(name, val, dec)                                             \
+        do {                                                                  \
+            char _fbuf[32];                                                   \
+            fmt_fixed(_fbuf, sizeof(_fbuf), (val), (dec));                    \
+            APPEND(name " %s\n", _fbuf);                                      \
         } while (0)
 
     APPEND("# HELP echo_sensors_ready 1 when the sensor subsystem is initialized\n"
@@ -267,27 +398,25 @@ static esp_err_t handle_metrics(httpd_req_t *req) {
     APPEND("# HELP echo_imu_ok 1 when the QMI8658 IMU was detected\n"
            "# TYPE echo_imu_ok gauge\n"
            "echo_imu_ok %d\n", d.imu_ok);
-    APPEND("# TYPE echo_accel_mps2 gauge\n"
-           "echo_accel_mps2{axis=\"x\"} %.3f\n"
-           "echo_accel_mps2{axis=\"y\"} %.3f\n"
-           "echo_accel_mps2{axis=\"z\"} %.3f\n",
-           d.accel_x, d.accel_y, d.accel_z);
-    APPEND("# TYPE echo_gyro_dps gauge\n"
-           "echo_gyro_dps{axis=\"x\"} %.3f\n"
-           "echo_gyro_dps{axis=\"y\"} %.3f\n"
-           "echo_gyro_dps{axis=\"z\"} %.3f\n",
-           d.gyro_x, d.gyro_y, d.gyro_z);
-    APPEND("# TYPE echo_imu_temp_celsius gauge\n"
-           "echo_imu_temp_celsius %.2f\n", d.imu_temp_c);
+    APPEND("# TYPE echo_accel_mps2 gauge\n");
+    APPF("echo_accel_mps2{axis=\"x\"}", d.accel_x, 3);
+    APPF("echo_accel_mps2{axis=\"y\"}", d.accel_y, 3);
+    APPF("echo_accel_mps2{axis=\"z\"}", d.accel_z, 3);
+    APPEND("# TYPE echo_gyro_dps gauge\n");
+    APPF("echo_gyro_dps{axis=\"x\"}", d.gyro_x, 3);
+    APPF("echo_gyro_dps{axis=\"y\"}", d.gyro_y, 3);
+    APPF("echo_gyro_dps{axis=\"z\"}", d.gyro_z, 3);
+    APPEND("# TYPE echo_imu_temp_celsius gauge\n");
+    APPF("echo_imu_temp_celsius", d.imu_temp_c, 2);
 
     // Temp / humidity
     APPEND("# HELP echo_th_ok 1 when the SHTC3 temp/humidity sensor was detected\n"
            "# TYPE echo_th_ok gauge\n"
            "echo_th_ok %d\n", d.th_ok);
-    APPEND("# TYPE echo_temperature_celsius gauge\n"
-           "echo_temperature_celsius %.2f\n", d.temp_c);
-    APPEND("# TYPE echo_humidity_percent gauge\n"
-           "echo_humidity_percent %.1f\n", d.humidity_rh);
+    APPEND("# TYPE echo_temperature_celsius gauge\n");
+    APPF("echo_temperature_celsius", d.temp_c, 2);
+    APPEND("# TYPE echo_humidity_percent gauge\n");
+    APPF("echo_humidity_percent", d.humidity_rh, 1);
 
     // Battery
     APPEND("# HELP echo_battery_ok 1 when the battery ADC reading is valid\n"
@@ -305,8 +434,20 @@ static esp_err_t handle_metrics(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "text/plain; version=0.0.4");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (truncated) {
+        // Never emit a partial exposition under HTTP 200 — a Prometheus
+        // scrape would ingest a half-line. Surface it so it gets noticed and
+        // the buffer is enlarged, rather than silently dropping metrics (R9).
+        ESP_LOGE(TAG, "/metrics truncated at %u bytes -- enlarge body[]", (unsigned)n);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "metrics truncated\n");
+        #undef APPEND
+        #undef APPF
+        return ESP_OK;
+    }
     httpd_resp_send(req, body, n);
     #undef APPEND
+    #undef APPF
     return ESP_OK;
 }
 

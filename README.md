@@ -46,6 +46,157 @@ Note: bootloader on this chip lives at **0x2000** (not the classic 0x1000 —
 same as C3/C6/H2), confirmed by the `0xE9` image-header magic byte at that
 offset in the raw flash dump.
 
+## Build & deploy
+
+ESP-IDF **v6.1-dev** (vendored at `/Volumes/repo/esp/esp-idf`), target
+**esp32c5** (CMake project `echo`). **Do NOT use `/Volumes/repo/esp/esp-idf-v5.5.4`**
+— its pinned toolchain (`esp-14.2.0`) does NOT support the ESP32-C5 and fails with
+`cc1: error: unknown cpu 'esp32c5' for '-mtune'`. C5 support needs the newer IDF
+(v6.x). The running firmware's `/info` reports its IDF build (e.g.
+`v6.1-dev-7562-g85c826ecb1d`) — the IDF you build with must match that line, so
+`/info` is the source of truth for which IDF this board was built with.
+
+### Build
+
+```bash
+export IDF_PATH=/Volumes/repo/esp/esp-idf   # v6.1-dev — supports esp32c5
+source $IDF_PATH/export.sh          # once per shell
+cd /Volumes/repo/esp/echo
+idf.py set-target esp32c5            # once (writes sdkconfig); already set in-repo
+idf.py build                        # -> build/echo.bin
+```
+
+There is **no host-test harness** in echo (no `test/`/`shared/` dir, unlike
+lumen) — a clean `idf.py build` is the verification bar here.
+
+### Deploy over USB (always for the first flash of a new feature)
+
+Native USB-CDC (no external UART chip), so the port is a `usbmodem`:
+
+```bash
+idf.py -p <port> flash monitor      # e.g. /dev/cu.usbmodem* ; Ctrl-] to exit
+```
+
+**The first flash after any change that could affect boot MUST be over USB** —
+OTA writes the inactive A/B slot and can't recover a device that won't boot.
+
+### Deploy over OTA (wireless, after the board is up and reachable)
+
+echo runs a key-gated pull-OTA server (`main/ota.c`): the *device* downloads the
+`.bin` from the LAN nginx host, so no host firewall/connect-back applies. A/B
+partitions (`ota_0`/`ota_1`) mean a bad/interrupted OTA leaves the running image
+intact (and a non-confirmed image is rolled back — see below).
+
+**Use the deploy script — do NOT do it by hand.** `scripts/deploy_ota.sh`
+(added 2026-10-10) does the whole thing and VERIFIES each step, so a failure is
+reported instead of looking like success:
+
+```bash
+scripts/deploy_ota.sh            # auto-bumps PROJECT_VER, builds, deploys, confirms
+scripts/deploy_ota.sh --no-bump  # deploy the current version as-is
+BOARD_IP=192.168.2.198 scripts/deploy_ota.sh   # override board IP
+```
+
+What it does (and why each step exists — all learned the hard way):
+1. **Bumps `PROJECT_VER`** in CMakeLists.txt. `/info` reports PROJECT_VER (via
+   `esp_app_get_description()->version`), NOT a git hash — if you don't bump it a
+   successful OTA reboots into the SAME version string and is indistinguishable
+   from a no-op. Bumping lets the script PROVE the OTA landed by watching
+   `/info` flip N -> N+1.
+2. **Builds** with the correct IDF (`/Volumes/repo/esp/esp-idf`, v6.1-dev).
+3. **Publishes atomically** (scp to `echo.bin.tmp` then `mv`) so the board can
+   never fetch a half-written file if an OTA fires mid-copy.
+4. **SHA-verifies the served copy** against the local build — catches a failed
+   publish before triggering.
+5. **Triggers** the board `/ota` using OTA_KEY + OTA_URL_PREFIX read straight
+   from `secrets/secrets.h` (so they can't drift from what the firmware
+   enforces), retrying up to 3× on a transient `ota task start failed`.
+6. **Polls `/info`** until the version flips AND stays (no rollback), reporting
+   SUCCESS or a clear WARNING. Watch the board's on-screen **device-info page**
+   (last tile, swipe right) — its `ota:` line shows the attempt #, time-ago, and
+   result (`running` / `ok (rebooting)` / `http connect fail` / ...).
+
+Config the script uses (override via env): `BOARD_IP=192.168.2.198`,
+`FW_HOST=192.168.2.7`, `FW_PORT=8091`, `FW_USER=mathias`,
+`FW_DIR=~/vegena-ota/firmware/echo`. OTA_KEY (`echo-ota`, PER-BOARD, not the
+shared `vegena-ota`) and OTA_URL_PREFIX come from `secrets/secrets.h`.
+
+#### Known OTA behaviour / gotchas (2026-10-10 debugging session)
+- **A non-confirmed image is ROLLED BACK.** sdkconfig selects
+  `CONFIG_BOOTLOADER_APP_ROLLBACK` + `CONFIG_BOOTLOADER_APP_ROLLBACK_CONFIRM_BY_APP`
+  (application-controlled confirmation — NOT the SDK's CONFIRM_ON_STARTUP, which
+  would auto-confirm before `app_main` runs and make the health gate a no-op). So
+  a freshly-OTA'd image boots as `ESP_OTA_IMG_PENDING_VERIFY` and STAYS pending
+  until `app_main.c` calls `esp_ota_mark_app_valid_cancel_rollback()` — which it
+  does only AFTER the HTTP server (the only remote-recovery path) is up. If the
+  new image wedges before that (WiFi/HTTP never comes up), it is never confirmed
+  and the bootloader rolls back to the previous slot on the next reset. Symptom:
+  OTA reboots but `/info` keeps showing the OLD version — that is the gate working
+  (the new image failed to prove itself), not a deploy error. Verified on hardware
+  2026-10-10: a v47 OTA that failed to confirm rolled back cleanly to v46.
+- **OTA reliability — root cause FOUND and fixed (2026-10-10).** OTA was failing
+  because the board was **internal-heap starved**: `/info` (which now exposes
+  `heap_free`/`heap_min`) showed `heap_min` dropping to **336 bytes** during an
+  OTA, so the HTTP/TLS connection + 8 KB OTA task couldn't allocate and failed
+  with `ESP_ERR_HTTP_CONNECT` / `esp-tls: select() timeout`. The board has 8 MB
+  PSRAM that was DISABLED in sdkconfig; enabling it (`CONFIG_SPIRAM=y`, quad,
+  80 MHz, `SPIRAM_USE_MALLOC`, `SPIRAM_TRY_ALLOCATE_WIFI_LWIP`) raised free heap
+  from ~22 KB to **~8.3 MB**. With that, OTA succeeds and the full confirm chain
+  runs (`OTA image confirmed valid (rollback cancelled)` in the boot log).
+  NOTE: an earlier claim that the cause was proven TIME_WAIT socket exhaustion
+  was WRONG — error 32774 = 0x8006 = `ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT` (a
+  connection timeout), not socket-alloc failure (0x8002). The keep-alive HA
+  client + LwIP MSL/socket tuning are kept as hygiene, not the fix.
+- **Bounded transfer supervisor** (`ota.c`): an `esp_timer` watchdog force-reboots
+  an OTA that stays busy past `OTA_TRANSFER_DEADLINE_US` (180 s). `esp_https_ota()`'s
+  helper retries a read-timeout in an UNBOUNDED loop, so a server that stalls
+  mid-body could otherwise wedge the board (`ota_in_progress:true` stuck) forever.
+  The force-reboot is safe: the A/B boot slot isn't switched until the image
+  verifies, so a mid-transfer reboot just resumes the running image.
+- **Residual: a MARGINAL WiFi link still causes occasional OTA failures.** With
+  heap fixed, the remaining intermittency is transport-level: on a weak link
+  (observed RSSI −55..−74 dBm with `wifi:m f null` missed-beacon bursts) a download
+  can hit `esp-tls select() timeout` and the whole OTA fails (it does NOT reboot —
+  the running image is untouched; just re-run the deploy). This is partly
+  environmental — improve antenna/placement vs the AP. A future hardening step is
+  a per-chunk retry/resume so a transient blip doesn't fail the whole transfer.
+  If an OTA ever wedges busy, recover by **USB-flashing** (below) — a full flash
+  resets the A/B `ota_data` cleanly.
+- **`ota task start failed`** (503) = the device couldn't allocate the OTA
+  worker's 8 KB stack at that instant (low free internal heap). Transient — the
+  script retries; the running image is untouched.
+
+#### USB flash (first flash of any boot-affecting change, or to recover a wedge)
+```bash
+export IDF_PATH=/Volumes/repo/esp/esp-idf && source $IDF_PATH/export.sh
+idf.py -p $(ls /dev/cu.usbmodem* | head -1) -b 115200 flash   # 115200: 460800 is unreliable here
+```
+**The first flash after any change that could affect boot MUST be over USB** —
+OTA writes the inactive A/B slot and can't recover a device that won't boot. USB
+flash is also the clean way out of a wedged `ota_in_progress:true` state.
+
+
+OTA guardrails (all in `main/ota.c`, mirroring lumen/Vegena):
+- **Key-gated** (`OTA_KEY`) — an unauthenticated `/ota?url=` is a LAN RCE hole.
+- **Host-allowlist prefix** (`OTA_URL_PREFIX`) — a key-gated endpoint that fetches
+  *any* URL is still an SSRF/arbitrary-firmware hole; the URL must be exactly
+  `<prefix><filename>`, no embedded `@` credentials, bounded length. Redirects are
+  disabled on the fetch.
+- A 2nd OTA while one is in flight is rejected.
+- **`CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y` is required in sdkconfig** for the plain
+  `http://` LAN pull — without it `esp_https_ota_begin()` rejects a non-TLS URL
+  outright. (LAN-only trust model: the prefix allowlist + key, not TLS.)
+
+Secrets (`OTA_KEY`, `OTA_URL_PREFIX`, WiFi, HA) live in a git-ignored
+`secrets/secrets.h` — never commit them (there's a `secrets.h.example`).
+
+### Before flashing a NEW board
+
+Capture a factory boot log + full flash backup FIRST — see `factory/` below.
+Non-negotiable. For Home Assistant / integrations, the reference pattern is the
+sibling **lumen** project (`/Volumes/repo/esp/lumen/main/ha/ha_client.cpp`) —
+echo is ESP-IDF like lumen (not Arduino like Vegena).
+
 ## Physical / network topology (how we're reaching it)
 
 The board's USB is physically plugged into **hp.local** (the Proxmox

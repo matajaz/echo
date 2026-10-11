@@ -33,6 +33,11 @@ static esp_lcd_touch_handle_t s_touch = NULL;
 // does not run with interrupts disabled.
 static SemaphoreHandle_t s_touch_mutex = NULL;
 
+// Serialises the lazy creation of s_touch_mutex above. Without it, two
+// tasks racing on the NULL check could each create a mutex -- one would be
+// leaked and the two would not actually serialise against each other.
+static portMUX_TYPE s_touch_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+
 static esp_err_t touch_init_locked(void);
 
 static esp_err_t touch_reset_pulse(void) {
@@ -56,7 +61,11 @@ esp_err_t touch_init(void) {
     // Serialise concurrent callers across the whole check-and-set so the
     // CST3530 is only ever brought up once.
     if (s_touch_mutex == NULL) {
-        s_touch_mutex = xSemaphoreCreateMutex();
+        portENTER_CRITICAL(&s_touch_mutex_init_lock);
+        if (s_touch_mutex == NULL) {
+            s_touch_mutex = xSemaphoreCreateMutex();
+        }
+        portEXIT_CRITICAL(&s_touch_mutex_init_lock);
         if (s_touch_mutex == NULL) {
             return ESP_ERR_NO_MEM;
         }
@@ -86,9 +95,16 @@ static esp_err_t touch_init_locked(void) {
 
     esp_lcd_panel_io_i2c_config_t io_cfg = ESP_LCD_TOUCH_IO_I2C_CST3530_CONFIG();
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
-    ESP_RETURN_ON_ERROR(
-        esp_lcd_new_panel_io_i2c(i2c_bus, &io_cfg, &tp_io_handle), TAG,
-        "touch panel IO init failed");
+    esp_err_t panel_io_ret = esp_lcd_new_panel_io_i2c(i2c_bus, &io_cfg, &tp_io_handle);
+    if (panel_io_ret != ESP_OK) {
+        ESP_LOGE(TAG, "touch panel IO init failed: 0x%x", panel_io_ret);
+        // The driver may have partially initialised the handle before
+        // failing, so release it here instead of leaking it on every retry.
+        if (tp_io_handle != NULL) {
+            esp_lcd_panel_io_del(tp_io_handle);
+        }
+        return panel_io_ret;
+    }
 
     const esp_lcd_touch_config_t tp_cfg = {
         .x_max = LCD_H_RES,
@@ -106,6 +122,12 @@ static esp_err_t touch_init_locked(void) {
         // ready" (caught live via the new /log endpoint).
         .driver_data = (void *)i2c_bus,
     };
+    // The store above relies on the CST3530 driver interpreting
+    // driver_data as the I2C master bus handle. Assert the handle is a
+    // pointer-sized object so this type-erased cast can never silently
+    // truncate it.
+    _Static_assert(sizeof(i2c_master_bus_handle_t) <= sizeof(void *),
+                   "i2c_master_bus_handle_t no longer fits in driver_data");
     esp_err_t ret = esp_lcd_touch_new_i2c_cst3530(tp_io_handle, &tp_cfg, &s_touch);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "CST3530 touch create failed: 0x%x", ret);
@@ -125,18 +147,31 @@ esp_lcd_touch_handle_t touch_get_handle(void) {
 }
 
 bool touch_get_point(uint16_t *x, uint16_t *y) {
-    if (s_touch == NULL) {
+    if (x == NULL || y == NULL || s_touch_mutex == NULL) {
         return false;
     }
 
-    esp_err_t ret = esp_lcd_touch_read_data(s_touch);
+    // Read the (lazily published) handle under the mutex so a concurrent
+    // touch_init() cannot race with this read. A successfully initialised
+    // handle is never freed, so the local copy stays valid after release.
+    if (xSemaphoreTake(s_touch_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    esp_lcd_touch_handle_t touch = s_touch;
+    xSemaphoreGive(s_touch_mutex);
+
+    if (touch == NULL) {
+        return false;
+    }
+
+    esp_err_t ret = esp_lcd_touch_read_data(touch);
     if (ret != ESP_OK) {
         return false;
     }
 
     esp_lcd_touch_point_data_t point = {0};
     uint8_t point_count = 0;
-    ret = esp_lcd_touch_get_data(s_touch, &point, &point_count, 1);
+    ret = esp_lcd_touch_get_data(touch, &point, &point_count, 1);
     if (ret != ESP_OK || point_count == 0) {
         return false;
     }

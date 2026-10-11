@@ -26,7 +26,7 @@
 # waveshare/custom_io_expander_ch32v003 has an incomplete REQUIRES in its
 # own CMakeLists.txt: it lists only "driver" (the pre-5.x umbrella driver
 # component), but its public header includes driver/i2c_master.h. Verified
-# against this IDF tree (6.2.0): i2c_master.h lives ONLY in
+# against this IDF tree (5.5.4): i2c_master.h lives ONLY in
 # components/esp_driver_i2c/include/driver/, and components/driver/ only
 # REQUIRES esp_hal_i2c -- NOT esp_driver_i2c. So "driver" does not
 # transitively supply that include path, and a clean resolve fails with
@@ -43,9 +43,18 @@
 # required. Note main/ also includes driver/i2c_master.h and declares no
 # REQUIRES of its own, so main/CMakeLists.txt needs esp_driver_i2c too.
 dependencies:
-  idf: ">=5.3"
+  # Pinned to the IDF range actually validated for this project (built and
+  # tested on the 5.5.x line). The "KNOWN UPSTREAM BUG" note below describes
+  # the component-hierarchy change (components/driver only REQUIRES
+  # esp_hal_i2c, esp_driver_i2c holding driver/i2c_master.h) that is assumed
+  # by that note; do NOT claim compatibility with 5.3/5.4 or with 6.x without
+  # re-verifying the REQUIRES chains and the manual patch against that tree.
+  idf: ">=5.5"
   waveshare/custom_io_expander_ch32v003: "^1.0.1"
-  waveshare/esp_lcd_touch_cst3530: "^0.0.2"
+  # waveshare/esp_lcd_touch_cst3530 is intentionally NOT a managed dep: a
+  # git-tracked local override lives in components/esp_lcd_touch_cst3530 with
+  # mandatory security fixes (R4 OOB checksum read + R5 stuck-press, 2026-10-10)
+  # that must survive a dependency refresh (managed_components/ is gitignored).
   # LVGL integration. esp_lvgl_port is Espressif's maintained adapter
   # (stable 1.x; the vendor 08_bookesia demo used the newer, beta-only
   # espressif/esp_lvgl_adapter 0.x -- we deliberately use the stable port

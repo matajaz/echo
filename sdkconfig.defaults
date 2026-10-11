@@ -6,3 +6,54 @@ CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
 # allowlist in ota.c (ota_url_allowed) is the actual SSRF/arbitrary-firmware
 # guard; this flag only lifts esp_https_ota's blanket http-is-unverified gate.
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+
+# --- Networking: resource headroom for concurrent HTTP (OTA + HA poll) ----
+# These reduce outbound-connection pressure. The connection-reuse change in
+# ha_client.c (ONE kept-alive client per poll cycle) is the real improvement:
+# it turns 4 connections/poll into 1, cutting churn regardless of the cause.
+# These two settings are defense-in-depth headroom:
+#   - shorter MSL => a closed TCP control block leaves TIME_WAIT in ~2*10s
+#     instead of ~2*60s, freeing control blocks faster under bursts
+#   - a few more socket descriptors for headroom (small RAM cost)
+#
+# UNVERIFIED (corrected 2026-10-10, Sol's review): an earlier note here claimed
+# the PROVEN root cause of "ESP_ERR_HTTP_CONNECT" was TIME_WAIT socket-pool
+# exhaustion. That is NOT established. The observed error 32774 = 0x8006 =
+# ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT (a connection-establishment TIMEOUT), NOT
+# socket-allocation failure (which would be 0x8002). ESP_ERR_HTTP_CONNECT can
+# wrap several underlying causes. The real failure stage still needs to be
+# captured on hardware (errno, transport error, heap headroom, active conns)
+# before any root cause is declared. Keep these settings — they don't hurt —
+# but treat them as headroom, not a proven fix.
+CONFIG_LWIP_TCP_MSL=10000
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# --- OTA rollback: application-controlled confirmation --------------------
+# Keep APP_ROLLBACK on, but DISABLE auto-confirm-on-startup so a freshly-OTA'd
+# image stays ESP_OTA_IMG_PENDING_VERIFY into app_main. echo then confirms it
+# (esp_ota_mark_app_valid_cancel_rollback) only AFTER the HTTP server — the
+# only remote-recovery path — is up. Without this, the SDK's ota_auto_confirm
+# startup hook marks the image VALID before app_main runs, so a post-startup
+# wedge (WiFi/HTTP/peripheral) is NOT rolled back. (Found by Sol's review,
+# 2026-10-10; corrects the earlier wrong assumption that the app_main confirm
+# was already the gate.)
+CONFIG_BOOTLOADER_APP_ROLLBACK_CONFIRM_BY_APP=y
+
+# --- PSRAM: fix internal-heap starvation (proven root cause, 2026-10-10) -----
+# /info showed heap_min dropping to 336 BYTES during OTA (LVGL+audio+sensors+
+# WiFi+HTTP+TLS+8KB OTA task all on ~20KB internal heap) -> connect/TLS failed.
+# The board HAS 8MB PSRAM (factory boot log: "Found 8MB PSRAM device, Speed
+# 80MHz, Adding pool of 3328K ... to heap allocator") but it was disabled.
+# Enable it quad @80MHz (matches factory) and let malloc + WiFi/LwIP use it,
+# which moves the heavy buffers off internal RAM. First flash MUST be over USB.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Reserve more INTERNAL (DMA-capable) RAM when PSRAM is on. The 32 KB default
+# was too small once PSRAM absorbed general malloc: I2S DMA buffer alloc
+# (i2s_channel_init_std_mode) failed with ESP_ERR_NO_MEM (0x101), disabling
+# audio, while aggregate heap looked huge (Sol's "DMA alloc can fail" warning,
+# 2026-10-10). 128 KB covers I2S + SPI-LCD DMA + WiFi internal needs.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=131072

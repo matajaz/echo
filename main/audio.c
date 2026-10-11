@@ -14,6 +14,7 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "audio";
@@ -66,12 +67,45 @@ static const char *TAG = "audio";
 // 32-bit word, so no critical section is needed for either operation.
 static volatile uint32_t s_stop_generation = 0;
 
+// #3 (2026-10-10): playback-liveness flag. True while a tone/song is in
+// flight, cleared when playback_finalize() has drained the DMA and closed the
+// codec. Owned/updated by the audio (player) task; read by any task via
+// audio_is_playing(). Single aligned word + volatile = the atomic,
+// compiler-can't-cache contract the header documents. audio_is_playing() was
+// previously DECLARED but never DEFINED (a latent link error + the UI had no
+// way to observe when a song finished); this backs it.
+static volatile bool s_playing = false;
+
 // Driver/codec handles + current volume (restored after a refactor dropped
 // them, which broke the build with 's_codec undeclared').
 static i2s_chan_handle_t s_tx_chan = NULL;
 static i2s_chan_handle_t s_rx_chan = NULL;
 static esp_codec_dev_handle_t s_codec = NULL;
 static int s_volume = AUD_DEFAULT_VOL;
+
+// V03 (2026-10-10): codec-ownership mutex. The startup tone (app_main) and the
+// UI song player (ui.c player_task) can both call into audio and would
+// otherwise open/write/close the SAME codec concurrently (esp_codec_dev_open
+// succeeds again on an already-open device, so it does not reject overlap).
+// Every public playback entry (tone/song) takes this for the whole
+// open->write->drain->close session, guaranteeing exactly one session + one
+// close. Non-blocking acquire with a short bound so a UI press never stalls
+// LVGL waiting on an in-progress tone; a busy codec simply rejects the request.
+static SemaphoreHandle_t s_play_mutex = NULL;
+
+// --- Audio command-owner service (review order 5, V03 preferred extension) ---
+// ONE task owns the codec. Callers (UI, app_main chime) ENQUEUE commands and
+// never touch I2S/codec/I2C. The host-tested policy in core/audio_cmd.h decides
+// transitions + latest-play acceptance; s_status is the observable state the UI
+// reads (F08 stop/mute/playback feedback). s_status is written ONLY by the
+// service task (single-owner), read by others behind a short critical section.
+#include "audio_cmd.h"
+static QueueHandle_t s_cmd_q = NULL;
+static audio_status_t s_status;                 // owned by the service task
+static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_cmd_next_id = 1;
+#define AUDIO_CMD_QUEUE_LEN 6
+static void audio_service_task(void *arg);
 
 void audio_request_stop(void) {
     s_stop_generation++; // invalidate whatever is currently playing
@@ -80,11 +114,17 @@ void audio_request_stop(void) {
 static esp_err_t i2s_bring_up(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(AUD_I2S_NUM, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
-    // Deeper DMA buffer (8 x 512 frames ~= 256 ms at 16 kHz) so a brief
-    // preemption of the audio task by LVGL/sensors/WiFi on this SINGLE-CORE
-    // chip can't drain the DMA before the next refill -> no underrun gaps.
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 512;
+    // DMA buffer sizing (2026-10-11): the full-duplex pair (tx+rx) allocates
+    // dma_desc_num * dma_frame_num * 2 bytes * 2 channels of DMA-CAPABLE
+    // INTERNAL RAM. 8x512 (~16 KB) did NOT fit the internal DMA pool left after
+    // display/LVGL + WiFi + HTTP init (boot log: "allocate I2S DMA buffer
+    // failed", audio init 0x101/NO_MEM, chime silently absent). 6x240 (~5.6 KB)
+    // fits with headroom and still gives ~90 ms/channel of buffering — enough
+    // to ride out a brief LVGL/WiFi preemption on this single-core chip. The
+    // deep buffers were documented "insurance", NOT the crackle fix (the real
+    // fix is the per-note envelope + continuous phase + drain-before-close).
+    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_frame_num = 240;
     // Create BOTH tx + rx channels (full-duplex pair sharing one BCLK/WS),
     // exactly like the vendor bsp_audio_init. Creating tx-only (rx=NULL)
     // made the ES8311 codec's clock-reconfig path mis-clock the DAC ->
@@ -115,32 +155,49 @@ static esp_err_t i2s_bring_up(void) {
     ret = i2s_channel_init_std_mode(s_tx_chan, &std_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s tx std init failed: 0x%x", ret);
-        return ret;
+        goto fail;
     }
     ret = i2s_channel_enable(s_tx_chan);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s tx enable failed: 0x%x", ret);
-        return ret;
+        goto fail;
     }
     // Init + enable the rx channel too (vendor does this; the codec's
     // clock reconfig expects both channels of the duplex pair to exist).
     ret = i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s rx std init failed: 0x%x", ret);
-        return ret;
+        goto fail;
     }
     ret = i2s_channel_enable(s_rx_chan);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s rx enable failed: 0x%x", ret);
-        return ret;
+        goto fail;
     }
     return ESP_OK;
+
+fail:
+    // Partial-init unwind (2026-10-10): a failure after i2s_new_channel left
+    // the channels allocated (DMA rings etc). Delete both so a failed audio
+    // init doesn't leak I2S resources. Disable first (ignore errors — a
+    // never-enabled channel just no-ops), then delete; NULL the handles.
+    if (s_rx_chan) { i2s_channel_disable(s_rx_chan); i2s_del_channel(s_rx_chan); s_rx_chan = NULL; }
+    if (s_tx_chan) { i2s_channel_disable(s_tx_chan); i2s_del_channel(s_tx_chan); s_tx_chan = NULL; }
+    return ret;
 }
 
 esp_err_t audio_init(void) {
     if (s_codec != NULL) {
         return ESP_OK;
     }
+    if (s_play_mutex == NULL) {
+        s_play_mutex = xSemaphoreCreateMutex();
+        if (s_play_mutex == NULL) {
+            ESP_LOGE(TAG, "V03: failed to create playback mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    audio_status_init(&s_status, AUD_DEFAULT_VOL);
     i2c_master_bus_handle_t bus = display_get_i2c_bus();
     esp_io_expander_handle_t exp = display_get_io_expander();
     if (bus == NULL || exp == NULL) {
@@ -155,6 +212,10 @@ esp_err_t audio_init(void) {
 
     esp_err_t ret = i2s_bring_up();
     if (ret != ESP_OK) {
+        // Partial-init unwind: we enabled the PA above; a failed I2S bring-up
+        // would otherwise leave the speaker amp powered (current + buzz) with
+        // no audio path. Turn it back off.
+        esp_io_expander_set_level(exp, AUD_PA_EXPANDER_PIN, 0);
         return ret;
     }
 
@@ -167,7 +228,7 @@ esp_err_t audio_init(void) {
     const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
     if (data_if == NULL) {
         ESP_LOGE(TAG, "audio_codec_new_i2s_data failed");
-        return ESP_FAIL;
+        goto codec_fail;
     }
 
     audio_codec_i2c_cfg_t i2c_cfg = {
@@ -178,7 +239,7 @@ esp_err_t audio_init(void) {
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
     if (ctrl_if == NULL) {
         ESP_LOGE(TAG, "audio_codec_new_i2c_ctrl failed");
-        return ESP_FAIL;
+        goto codec_fail;
     }
 
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
@@ -199,7 +260,7 @@ esp_err_t audio_init(void) {
     const audio_codec_if_t *es8311 = es8311_codec_new(&es_cfg);
     if (es8311 == NULL) {
         ESP_LOGE(TAG, "es8311_codec_new failed");
-        return ESP_FAIL;
+        goto codec_fail;
     }
 
     esp_codec_dev_cfg_t dev_cfg = {
@@ -210,13 +271,34 @@ esp_err_t audio_init(void) {
     s_codec = esp_codec_dev_new(&dev_cfg);
     if (s_codec == NULL) {
         ESP_LOGE(TAG, "esp_codec_dev_new failed");
-        return ESP_FAIL;
+        goto codec_fail;
     }
 
     esp_codec_dev_set_out_vol(s_codec, AUD_DEFAULT_VOL);
     ESP_LOGI(TAG, "ES8311 audio init success (I2S%d, %dHz, vol %d%%)",
              AUD_I2S_NUM, AUD_SAMPLE_RATE, AUD_DEFAULT_VOL);
+
+    // Start the command-owner service now that the codec exists (review order
+    // 5). Callers enqueue; this task is the sole codec driver.
+    if (s_cmd_q == NULL) s_cmd_q = xQueueCreate(AUDIO_CMD_QUEUE_LEN, sizeof(audio_cmd_t));
+    if (s_cmd_q == NULL) {
+        ESP_LOGE(TAG, "audio: failed to create command queue");
+        goto codec_fail;
+    }
+    if (xTaskCreate(audio_service_task, "audio_svc", 4096, NULL, 20, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "audio: failed to start service task");
+        goto codec_fail;
+    }
     return ESP_OK;
+
+codec_fail:
+    // Partial-init unwind: codec setup failed after I2S + PA were up.
+    // Disable the PA and delete the I2S channels so a failed audio init
+    // leaves no powered amp or leaked channels. (reached only via goto)
+    esp_io_expander_set_level(exp, AUD_PA_EXPANDER_PIN, 0);
+    if (s_rx_chan) { i2s_channel_disable(s_rx_chan); i2s_del_channel(s_rx_chan); s_rx_chan = NULL; }
+    if (s_tx_chan) { i2s_channel_disable(s_tx_chan); i2s_del_channel(s_tx_chan); s_tx_chan = NULL; }
+    return ESP_FAIL;
 }
 
 int audio_get_volume(void) {
@@ -241,14 +323,17 @@ int audio_adjust_volume(int delta) {
 // playback aborts instead of silently dropping audio.
 static esp_err_t codec_write_checked(const int16_t *samples, size_t count) {
     size_t bytes = count * AUD_BYTES_PER_SAMPLE;
-    int written = esp_codec_dev_write(s_codec, samples, bytes);
-    if (written < 0) {
-        ESP_LOGE(TAG, "codec write failed: %d", written);
-        return ESP_FAIL;
-    }
-    if ((size_t)written != bytes) {
-        ESP_LOGE(TAG, "short write: %d/%u bytes", written, (unsigned)bytes);
-        return ESP_ERR_INVALID_SIZE;
+    // esp_codec_dev_write() returns a STATUS CODE, not a byte count:
+    // ESP_CODEC_DEV_OK (0) means the whole buffer was written. The old code
+    // compared the return against `bytes` and so rejected EVERY successful
+    // write with ESP_ERR_INVALID_SIZE (260) — aborting playback on the first
+    // 40 ms of silence (R1, 2026-10-10). The driver blocks until the full
+    // buffer is queued, so there is no partial-write byte count to handle here.
+    int ret = esp_codec_dev_write(s_codec, (void *)samples, bytes);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "codec write failed: %d (%s)", ret,
+                 esp_err_to_name(ret));
+        return (ret < 0) ? ret : ESP_FAIL;
     }
     return ESP_OK;
 }
@@ -264,7 +349,15 @@ static esp_err_t playback_finalize(esp_err_t first) {
             first = close_ret;
         }
     }
+    s_playing = false;   // #3: playback fully drained + codec closed
     return first;
+}
+
+// #3: non-blocking playback-liveness query (declared in audio.h, was never
+// defined). True while a tone/song is in flight; false once playback_finalize
+// has drained the DMA and closed the codec.
+bool audio_is_playing(void) {
+    return s_playing;
 }
 
 // Stream `ms` of digital silence through the checked write path, giving
@@ -329,7 +422,7 @@ static esp_err_t render_note(int16_t *buf, int chunk, uint32_t ms,
     return ESP_OK;
 }
 
-esp_err_t audio_play_tone(uint32_t freq_hz, uint32_t duration_ms) {
+static esp_err_t audio_play_tone_locked(uint32_t freq_hz, uint32_t duration_ms) {
     if (s_codec == NULL) {
         ESP_LOGW(TAG, "audio not initialized");
         return ESP_ERR_INVALID_STATE;
@@ -343,8 +436,9 @@ esp_err_t audio_play_tone(uint32_t freq_hz, uint32_t duration_ms) {
     esp_err_t ret = esp_codec_dev_open(s_codec, &fs);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "codec open failed: 0x%x", ret);
-        return ret;
+        return ret;   // V07: open failed -> playback never started, flag stays false
     }
+    s_playing = true;   // V07: publish live only AFTER a successful open; playback_finalize() clears it
 
     // Mono 16-bit sine with raised-cosine fade in/out + drain before close
     // (per the audio analysis: hard edges + no drain = clicks).
@@ -394,6 +488,19 @@ esp_err_t audio_play_tone(uint32_t freq_hz, uint32_t duration_ms) {
     ESP_LOGI(TAG, "played %luHz tone for %lums", (unsigned long)freq_hz,
              (unsigned long)duration_ms);
     return ESP_OK;
+}
+
+// V03: public entry. Serialize the whole open->write->drain->close session so
+// the startup tone and a UI song press can never own the codec at once.
+esp_err_t audio_play_tone(uint32_t freq_hz, uint32_t duration_ms) {
+    if (s_play_mutex == NULL) return ESP_ERR_INVALID_STATE;   // audio_init not run
+    if (xSemaphoreTake(s_play_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "audio busy -- tone request rejected (another session active)");
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t r = audio_play_tone_locked(freq_hz, duration_ms);
+    xSemaphoreGive(s_play_mutex);
+    return r;
 }
 
 // Note frequencies (Hz).
@@ -480,7 +587,7 @@ const audio_song_t *audio_get_song(int index) {
     return &SONGS[index];
 }
 
-esp_err_t audio_play_song(int index) {
+static esp_err_t audio_play_song_locked(int index) {
     if (s_codec == NULL) {
         ESP_LOGW(TAG, "audio not initialized");
         return ESP_ERR_INVALID_STATE;
@@ -511,6 +618,7 @@ esp_err_t audio_play_song(int index) {
         ESP_LOGE(TAG, "codec open failed: 0x%x", ret);
         return ret;
     }
+    s_playing = true;   // V07: publish live only AFTER a successful open; playback_finalize() clears it
     // Every write below is checked and every exit funnels through
     // playback_finalize(), so the codec is closed exactly once and the
     // first error observed is what the caller gets back.
@@ -552,7 +660,10 @@ esp_err_t audio_play_song(int index) {
             ESP_LOGI(TAG, "song '%s' canceled", song->name);
             // A cancel is not a failure: return without a spurious error,
             // but still drain + close cleanly so the next song starts on a
-            // quiet codec.
+            // quiet codec. Without the drain the codec is closed with
+            // samples still queued in the I2S DMA, truncating the tail
+            // (the same click the non-cancel path drains to avoid).
+            vTaskDelay(pdMS_TO_TICKS(AUD_DRAIN_DELAY_MS));
             (void)playback_finalize(ESP_OK);
             return ESP_OK;
         }
@@ -567,4 +678,103 @@ esp_err_t audio_play_song(int index) {
     }
     ESP_LOGI(TAG, "played song '%s'", song->name);
     return ESP_OK;
+}
+
+// V03: public entry. Same codec-ownership serialization as audio_play_tone.
+esp_err_t audio_play_song(int index) {
+    if (s_play_mutex == NULL) return ESP_ERR_INVALID_STATE;   // audio_init not run
+    if (xSemaphoreTake(s_play_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "audio busy -- song request rejected (another session active)");
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t r = audio_play_song_locked(index);
+    xSemaphoreGive(s_play_mutex);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Command-owner service (review order 5). The ONLY task that drives the codec.
+// ---------------------------------------------------------------------------
+static void audio_service_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        audio_cmd_t c;
+        if (xQueueReceive(s_cmd_q, &c, portMAX_DELAY) != pdTRUE) continue;
+        switch (c.type) {
+            case AUDIO_CMD_TONE: {
+                audio_on_start(&s_status, false, -1);
+                audio_on_playing(&s_status);
+                esp_err_t r = audio_play_tone(c.arg, c.arg2); // takes the play mutex
+                audio_on_finished(&s_status, (r == ESP_OK) ? 0 : (int32_t)r);
+                break;
+            }
+            case AUDIO_CMD_SONG: {
+                audio_on_start(&s_status, true, c.arg);
+                audio_on_playing(&s_status);
+                esp_err_t r = audio_play_song(c.arg);         // honors cancel generation
+                audio_on_finished(&s_status, (r == ESP_OK) ? 0 : (int32_t)r);
+                break;
+            }
+            case AUDIO_CMD_STOP:
+                audio_on_stopping(&s_status);
+                audio_request_stop();   // async; the in-flight song unwinds + finalizes
+                break;
+            case AUDIO_CMD_SET_VOLUME: {
+                int nv = audio_adjust_volume(c.arg); // c.arg is a delta
+                portENTER_CRITICAL(&s_status_mux);
+                if (nv >= 0) s_status.volume = nv;
+                portEXIT_CRITICAL(&s_status_mux);
+                break;
+            }
+            case AUDIO_CMD_MUTE: {
+                bool mute = (c.arg != 0);
+                // Mute = set volume 0 but remember the prior level to restore.
+                static int s_premute_vol = -1;
+                if (mute) {
+                    int cur = audio_get_volume();
+                    if (cur > 0) s_premute_vol = cur;
+                    audio_adjust_volume(-100);   // clamps to 0
+                } else if (s_premute_vol > 0) {
+                    audio_adjust_volume(s_premute_vol - audio_get_volume());
+                }
+                portENTER_CRITICAL(&s_status_mux);
+                s_status.muted = mute;
+                s_status.volume = audio_get_volume() < 0 ? s_status.volume : audio_get_volume();
+                portEXIT_CRITICAL(&s_status_mux);
+                break;
+            }
+            default: break;
+        }
+    }
+}
+
+// Enqueue a command (non-blocking). Latest-play policy for tone/song is applied
+// by the service via audio_request_stop() before the new session. Returns false
+// if audio isn't initialized or the queue is full. Safe from ANY task.
+static bool audio_post(audio_cmd_type_t t, int32_t arg, int32_t arg2) {
+    if (s_cmd_q == NULL) return false;
+    if (!audio_cmd_accept(&s_status, t)) return false;
+    // For a new tone/song, ask any in-flight song to stop first (latest-play).
+    if ((t == AUDIO_CMD_TONE || t == AUDIO_CMD_SONG) && audio_is_active(&s_status)) {
+        audio_request_stop();
+    }
+    audio_cmd_t c = { .type = t, .arg = arg, .arg2 = arg2,
+                      .id = __atomic_fetch_add(&s_cmd_next_id, 1, __ATOMIC_RELAXED) };
+    portENTER_CRITICAL(&s_status_mux);
+    s_status.last_cmd_id = c.id;
+    portEXIT_CRITICAL(&s_status_mux);
+    return xQueueSend(s_cmd_q, &c, 0) == pdTRUE;
+}
+
+bool audio_post_song(int index)        { return audio_post(AUDIO_CMD_SONG, index, 0); }
+bool audio_post_tone(uint32_t f, uint32_t ms) { return audio_post(AUDIO_CMD_TONE, (int32_t)f, (int32_t)ms); }
+bool audio_post_stop(void)             { return audio_post(AUDIO_CMD_STOP, 0, 0); }
+bool audio_post_volume(int delta)      { return audio_post(AUDIO_CMD_SET_VOLUME, delta, 0); }
+bool audio_post_mute(bool mute)        { return audio_post(AUDIO_CMD_MUTE, mute ? 1 : 0, 0); }
+
+void audio_get_status(audio_status_t *out) {
+    if (!out) return;
+    portENTER_CRITICAL(&s_status_mux);
+    *out = s_status;
+    portEXIT_CRITICAL(&s_status_mux);
 }

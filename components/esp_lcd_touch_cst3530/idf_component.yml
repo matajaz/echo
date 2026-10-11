@@ -1,0 +1,12 @@
+dependencies:
+  esp_lcd_touch:
+    public: true
+    version: ^1.1.0
+  idf: '>=4.4.2'
+description: ESP LCD Touch CST3530 -The touch controller CST3530 is adapted by waveshare
+repository: git://github.com/waveshareteam/Waveshare-ESP32-components.git
+repository_info:
+  commit_sha: eb75c90a51cb0ec12e6b4fc001a4da1c74f62d08
+  path: display/touch/esp_lcd_touch_cst3530
+url: https://github.com/waveshareteam/Waveshare-ESP32-components/tree/master/display/touch/esp_lcd_touch_cst3530
+version: 0.0.2

@@ -32,6 +32,17 @@ extern "C" {
 //     already serialized on the audio mutex itself). No other task may call
 //     them, because a second caller would interleave codec open/close/write
 //     and volume sets on the same DMA.
+//     The audio task is PRIVATE to this module: audio_init() (in audio.c)
+//     creates and owns it, and it is deliberately not exposed here. Callers
+//     (e.g. ui.c) honor rule 1 by enqueueing work onto that task; they must
+//     not spawn their own task to drive this interface.
+//     ENFORCEMENT: the shared codec handle, the volume level and the
+//     playback sample buffer are additionally guarded by a module-internal
+//     mutex held at the top of audio_play_tone()/audio_play_song() and
+//     released only via the shared playback_finalize() path, and by the
+//     volume accessors. A concurrent caller therefore blocks rather than
+//     corrupting codec/sample-info state; the serialization rules above are
+//     still the intended usage.
 //
 //  2. NOT RE-ENTRANT. audio_play_tone()/audio_play_song() block until the
 //     last sample has drained and the codec has been closed. Never call them
@@ -43,6 +54,12 @@ extern "C" {
 //     while audio_init() is still creating the codec, or while a playback is
 //     closing it, races the codec handle. Rule (1) is what makes that
 //     impossible -- there is no concurrent init/deinit path.
+//     SINGLE-SHOT: this module is deliberately one-way for the lifetime of
+//     the process. There is NO audio_deinit()/teardown entry point -- I2S
+//     channels, the codec handle and the PA enable are never released once
+//     acquired. A restart/re-init flow must reboot the device rather than
+//     tear down and rebuild the audio stack; do not expect a second
+//     audio_init() to free an earlier instance.
 //
 //  4. LOCK ORDERING. If a caller adds its own locking instead of routing
 //     through the audio task, the audio lock is the INNERMOST (leaf) lock:
@@ -56,7 +73,12 @@ extern "C" {
 // Bring up I2S + the ES8311 codec and enable the speaker PA. Requires
 // display_init() to have succeeded (reuses its shared I2C bus + CH32
 // expander handle). Non-fatal to the rest of the system.
-// Must run on the audio task (THREADING rule 1); it is idempotent.
+//
+// LIFECYCLE (THREADING rule 1): this is the entry point that CREATES and
+// owns the private audio task, so it must NOT be called from that task --
+// call it once from a startup task before any other function here. It is
+// idempotent: a second call returns ESP_OK without rebuilding an earlier
+// instance (see SINGLE-SHOT above).
 esp_err_t audio_init(void);
 
 // Play a short sine-wave test tone (blocking) at the given frequency and
@@ -65,6 +87,12 @@ esp_err_t audio_init(void);
 // Serialized with audio_play_song(): the audio task must not have another
 // playback in flight, or the tone blocks until that playback has drained and
 // closed the codec.
+//
+// STOP SEMANTICS (asymmetry vs. audio_play_song): a tone is short and is
+// NOT interruptible -- it does not consult the cancel generation, so an
+// audio_request_stop() issued while a tone plays has no effect on it. Only
+// audio_play_song() honors audio_request_stop() (at note boundaries). Callers
+// that need cancellable audio must use audio_play_song()/the song path.
 esp_err_t audio_play_tone(uint32_t freq_hz, uint32_t duration_ms);
 
 // A single note: frequency in Hz (0 = rest) and duration in ms.
@@ -112,6 +140,14 @@ esp_err_t audio_play_song(int index);
 // before a new song starts is never lost. It does NOT provide a
 // stop-AND-WAIT guarantee: do not treat it as "the song has stopped" before
 // the audio task has returned from audio_play_song().
+//
+// MEMORY ORDERING: the cancel generation and the playing flag are shared
+// across tasks on the SMP ESP32-C5. They are read/written atomically (single
+// aligned word) and both are declared volatile in audio.c so the compiler
+// cannot cache them across the polling loop; the audio task re-reads the
+// generation on every iteration. There is still no ordering barrier pairing
+// audio_request_stop() with audio_is_playing(), so do not use the flag as a
+// full memory fence for other state -- it only reports playback liveness.
 void audio_request_stop(void);
 
 // Playback-state query. Because audio_request_stop() is asynchronous and
@@ -132,6 +168,21 @@ bool audio_is_playing(void);
 // volume change can never race init, playback or teardown of the codec.
 int audio_get_volume(void);
 int audio_adjust_volume(int delta);
+
+// --- Command-owner service (review order 5) --------------------------------
+// Preferred API for callers (UI, app_main): ENQUEUE a command onto the audio
+// service task, which is the sole codec driver. Non-blocking; safe from ANY
+// task (including the LVGL task) — no I2C/codec is touched by the caller.
+// Latest-play: a new tone/song cancels an in-flight song first. Returns false
+// if audio isn't initialized or the bounded queue is full.
+#include "audio_cmd.h"   // audio_status_t / audio_state_t (host-tested policy)
+bool audio_post_song(int index);
+bool audio_post_tone(uint32_t freq_hz, uint32_t duration_ms);
+bool audio_post_stop(void);
+bool audio_post_volume(int delta);
+bool audio_post_mute(bool mute);
+// Snapshot the observable playback state (F08: stop/mute/playback feedback).
+void audio_get_status(audio_status_t *out);
 
 #ifdef __cplusplus
 }

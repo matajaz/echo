@@ -33,6 +33,9 @@ esp_lcd_touch_handle_t touch_get_handle(void);
 // panel is currently being touched, with *x/*y filled in panel pixel
 // coordinates (0..239, 0..319). Returns false (x/y untouched) if not
 // touched or if touch_init() hasn't succeeded yet.
+//
+// Preconditions: x and y must both be non-NULL; passing NULL on a
+// touched panel would dereference a NULL pointer.
 bool touch_get_point(uint16_t *x, uint16_t *y);
 
 #ifdef __cplusplus

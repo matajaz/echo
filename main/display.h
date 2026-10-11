@@ -58,6 +58,10 @@ esp_err_t display_set_backlight(int percent);
 // each creating their own -- the I2C bus and the CH32V003 chip can only
 // have one real owner each. Both return NULL/invalid until display_init()
 // has succeeded at least once.
+//
+// OWNERSHIP: the returned handles are owned by this module -- callers must
+// NOT delete/free/reconfigure them (e.g. no i2c_del_master_bus() or
+// esp_io_expander_del()). Doing so breaks every other user on the bus.
 i2c_master_bus_handle_t display_get_i2c_bus(void);
 esp_io_expander_handle_t display_get_io_expander(void);
 
@@ -65,6 +69,10 @@ esp_io_expander_handle_t display_get_io_expander(void);
 // layer (esp_lvgl_port) can attach to the SAME panel display_init()
 // already created, rather than re-initializing the SPI bus / panel. Both
 // return NULL until display_init() has succeeded.
+//
+// OWNERSHIP: the returned handles are owned by this module -- callers must
+// NOT delete/free/reconfigure them (e.g. no esp_lcd_panel_del() or
+// esp_lcd_panel_io_del()). Doing so breaks every other user of the panel.
 esp_lcd_panel_handle_t display_get_panel(void);
 esp_lcd_panel_io_handle_t display_get_panel_io(void);
 

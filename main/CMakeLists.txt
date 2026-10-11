@@ -1,6 +1,6 @@
 idf_component_register(
-    SRCS "app_main.c" "ota.c" "display.c" "touch.c" "weblog.c" "ui.c" "sensors.c" "audio.c"
-    INCLUDE_DIRS "." "../secrets"
+    SRCS "app_main.c" "ota.c" "display.c" "touch.c" "weblog.c" "ui.c" "sensors.c" "audio.c" "ha_client.c" "board_services.c"
+    INCLUDE_DIRS "." "../secrets" "../core"
     EMBED_TXTFILES "certs/ota_ca.pem"
     REQUIRES
         esp_event esp_netif esp_wifi nvs_flash

@@ -22,11 +22,11 @@
 #include "freertos/semphr.h"
 
 #define RING_LINES 200       // fixed line count (wraps); ~200 * ~160B ~= 32KB
-#define LINE_MAX 160         // per-line cap incl. NUL; longer lines truncated
+#define WEBLOG_LINE_MAX 160         // per-line cap incl. NUL; longer lines truncated
 
 typedef struct {
     uint32_t id;             // monotonic line id (0 = empty slot)
-    char text[LINE_MAX];
+    char text[WEBLOG_LINE_MAX];
 } log_line_t;
 
 static log_line_t s_ring[RING_LINES];
@@ -60,8 +60,9 @@ static int weblog_vprintf(const char *fmt, va_list args) {
     } else {
         ret = vprintf(fmt, args);
     }
+    va_end(args);
 
-    char buf[LINE_MAX];
+    char buf[WEBLOG_LINE_MAX];
     int n = vsnprintf(buf, sizeof(buf), fmt, args_copy);
     va_end(args_copy);
     if (n > 0 && s_lock != NULL) {
@@ -119,27 +120,36 @@ static esp_err_t handle_log_txt(httpd_req_t *req) {
 
     // Walk the ring oldest->newest; include a line if its id qualifies.
     // Without ?since: a tail of the last ~60. With ?since: only id > since.
+    // A cursor ahead of the newest id means the board rebooted and ids reset
+    // below the client's position; fall back to a tail so the collector can
+    // observe the gap instead of stalling forever.
+    bool stale_since = have_since && since > newest;
     const uint32_t tail_n = 60;
-    uint32_t tail_floor = (!have_since && newest > tail_n) ? (newest - tail_n) : 0;
+    uint32_t tail_floor = ((!have_since || stale_since) && newest > tail_n) ? (newest - tail_n) : 0;
 
     // Build body under the lock into a bounded heap buffer, then release the
     // lock and send -- never send() while holding the ring mutex.
     size_t cap = 8192;
     char *body = malloc(cap);
     size_t used = 0;
+    // Initialize immediately: an empty incremental read (e.g. ?since=<newest>
+    // with no new line yet) appends nothing, and later code must see a valid
+    // empty string, not uninitialized heap. Reading strlen() on an un-init'd
+    // malloc was a heap-buffer-overread (R3, ASan, 2026-10-10).
+    if (body) body[0] = '\0';
     uint32_t last_included = 0;   // id of the last line actually written out
     bool have_included = false;
     bool truncated = false;
     // The advertised cursor must only ever name a line the collector really
     // received. Until we know the body was sent in full, stay where the
     // client already was so nothing is skipped.
-    uint32_t cursor = have_since ? since : 0;
+    uint32_t cursor = (have_since && !stale_since) ? since : 0;
     if (body) {
         for (int i = 0; i < RING_LINES; i++) {
             int idx = (s_head + i) % RING_LINES;   // oldest first
             uint32_t id = s_ring[idx].id;
             if (id == 0) continue;                  // empty slot
-            if (have_since ? (id <= since) : (id <= tail_floor)) continue;
+            if ((!have_since || stale_since) ? (id <= tail_floor) : (id <= since)) continue;
             size_t need = strlen(s_ring[idx].text) + 1;
             if (used + need + 1 >= cap) {           // bounded; stop appending
                 truncated = true;
@@ -153,12 +163,13 @@ static esp_err_t handle_log_txt(httpd_req_t *req) {
         }
         if (!truncated) {
             // Every qualifying line fit, so the client may resume from the
-            // newest id (or from its own cursor, if it was already ahead).
-            cursor = (have_since && since > newest) ? since : newest;
+            // newest id (a stale cursor is advanced here so the collector
+            // stops pinning to an id that will never reappear).
+            cursor = newest;
         } else {
             // Acknowledge only the prefix actually sent; the remainder stays
             // pending and is re-requested via ?since=<cursor>.
-            cursor = have_included ? last_included : (have_since ? since : 0);
+            cursor = have_included ? last_included : ((have_since && !stale_since) ? since : 0);
         }
     }
     xSemaphoreGive(s_lock);
@@ -172,12 +183,23 @@ static esp_err_t handle_log_txt(httpd_req_t *req) {
     if (hlen < 0) {
         hlen = 0;
     }
-    size_t blen = body ? strlen(body) : 0;
+    // Use the tracked 'used' length — authoritative and never rescans the
+    // buffer (R3). body is '\0'-initialized above, so used==0 is a valid empty.
+    size_t blen = body ? used : 0;
     size_t total = (size_t)hlen + blen;
     char *resp = malloc(total + 1);
     if (resp == NULL) {
+        // Could not assemble header+body as one send. Sending the header alone
+        // would advance the collector's cursor past body lines it never got
+        // (R3). Send a SAFE cursor that doesn't skip anything: the client's
+        // own prior position (resume from there and retry), not the advanced
+        // one. With no prior ?since, send id 0 so it re-pulls a tail.
         free(body);
-        httpd_resp_sendstr(req, header);
+        uint32_t safe_cursor = (have_since && !stale_since) ? since : 0;
+        char safe_header[32];
+        int sl = snprintf(safe_header, sizeof(safe_header), "id: %u\n",
+                          (unsigned)safe_cursor);
+        httpd_resp_send(req, safe_header, (sl > 0) ? sl : 0);
         return ESP_OK;
     }
     memcpy(resp, header, (size_t)hlen);
@@ -211,7 +233,7 @@ static const char *HTML_TAIL = "</pre></body></html>";
 // server is ever configured so handlers can run concurrently, move this to
 // per-request heap (or it will clobber a concurrent /log response).
 #define HTML_BATCH_LINES 16
-static char s_html_batch[HTML_BATCH_LINES][LINE_MAX];
+static char s_html_batch[HTML_BATCH_LINES][WEBLOG_LINE_MAX];
 
 // Append *s* to the chunked response with HTML-escaping, one char at a time
 // (line-by-line / char-by-char avoids a second full escaped copy of the
@@ -260,12 +282,20 @@ static esp_err_t handle_log_html(httpd_req_t *req) {
     }
 
     if (s_lock != NULL) {
-        // Snapshot the head (and the newest id) once so lines written during
-        // this chunked, possibly slow response cannot shift the index
-        // mid-stream and duplicate or skip lines. Anything newer than the
+        // Snapshot the head (and the newest id) once, under the lock, so lines
+        // written during this chunked, possibly slow response cannot shift the
+        // index mid-stream and duplicate or skip lines. Anything newer than the
         // snapshot waits for the next auto-refresh.
-        int start = s_head;
-        uint32_t newest = (s_next_id > 1) ? (s_next_id - 1) : 0;
+        int start;
+        uint32_t newest;
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+            start = 0;
+            newest = 0;
+        } else {
+            start = s_head;
+            newest = (s_next_id > 1) ? (s_next_id - 1) : 0;
+            xSemaphoreGive(s_lock);
+        }
         int i = 0;
         for (;;) {
             int n = 0;
@@ -279,7 +309,7 @@ static esp_err_t handle_log_html(httpd_req_t *req) {
                 uint32_t id = s_ring[idx].id;
                 if (id == 0) continue;                 // empty slot
                 if (newest != 0 && id > newest) continue;  // newer than snapshot
-                strlcpy(s_html_batch[n], s_ring[idx].text, LINE_MAX);
+                strlcpy(s_html_batch[n], s_ring[idx].text, WEBLOG_LINE_MAX);
                 n++;
             }
             xSemaphoreGive(s_lock);
@@ -316,9 +346,13 @@ esp_err_t weblog_register(httpd_handle_t server) {
     esp_err_t r1 = httpd_register_uri_handler(server, &log_html);
     esp_err_t r2 = httpd_register_uri_handler(server, &log_txt);
     if (r1 != ESP_OK || r2 != ESP_OK) {
-        // Don't leave /log registered on a partial failure.
+        // Don't leave a partially-registered pair behind; a retry would then
+        // fail with ESP_ERR_HTTPD_HANDLER_EXISTS for whichever succeeded.
         if (r1 == ESP_OK) {
             httpd_unregister_uri_handler(server, log_html.uri, log_html.method);
+        }
+        if (r2 == ESP_OK) {
+            httpd_unregister_uri_handler(server, log_txt.uri, log_txt.method);
         }
         return ESP_FAIL;
     }

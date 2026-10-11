@@ -54,12 +54,53 @@ typedef struct {
     bool bat_ok;
     uint16_t bat_adc;  // raw 0..1023
     int bat_soc_pct;   // estimated 0..100
+
+    // FRESHNESS/QUALITY (R10, 2026-10-10). The *_ok flags above mean the
+    // sensor was DETECTED at init; they do NOT mean the current value is
+    // fresh. These are the monotonic timestamp (ms since boot, from
+    // esp_timer) of the LAST SUCCESSFUL read of each group. 0 = never read
+    // successfully. A consumer treats a value as STALE when
+    // (now_ms - *_last_ms) exceeds a threshold, and should render "--"
+    // rather than a stale/zero value. now_ms is published alongside so a
+    // single coherent snapshot can compute age without racing the clock.
+    uint32_t now_ms;        // esp_timer ms at publish time
+    uint32_t imu_last_ms;   // last good accel/gyro read
+    uint32_t th_last_ms;    // last good temp/humidity read
+    uint32_t rtc_last_ms;   // last good RTC read
+    uint32_t bat_last_ms;   // last good battery read
 } sensors_data_t;
+
+// Freshness threshold: a group whose last good read is older than this is
+// STALE. The poll runs every ~5 s, so 15 s = ~3 missed reads.
+#define SENSORS_STALE_MS 15000
+
+// V05a: freshness MUST be measured against the READER's current clock, not the
+// producer's publish-time now_ms. If the poll worker stops/parks after a good
+// publish, the stored now_ms freezes and (now_ms - last_ms) stays small forever
+// -> data looks fresh indefinitely. Callers pass esp_timer_get_time()/1000 read
+// at reader time. (Unsigned subtraction handles the ~49-day ms wrap.)
+static inline bool sensors_group_fresh_at(uint32_t last_ms, uint32_t reader_now_ms) {
+    return last_ms != 0 && (uint32_t)(reader_now_ms - last_ms) <= SENSORS_STALE_MS;
+}
+
+// DEPRECATED (V05a): compares against the producer's frozen publish-time, so a
+// stopped worker reads fresh forever. Prefer sensors_group_fresh_at() with a
+// reader-time clock. Retained only so existing callers compile.
+static inline bool sensors_group_fresh(uint32_t last_ms, uint32_t now_ms) {
+    return last_ms != 0 && (uint32_t)(now_ms - last_ms) <= SENSORS_STALE_MS;
+}
 
 // Bring up all three sensors on the shared I2C bus and start the poll
 // task. Requires display_init() to have succeeded (reuses its bus).
-// Returns ESP_OK if the subsystem started (even if some individual
-// sensors failed -- check the per-sensor *_ok flags via sensors_get()).
+//
+// IDEMPOTENT: calling sensors_init() again after a successful call is a
+// no-op that returns ESP_OK -- it does NOT spawn a second poll task, does
+// NOT re-initialize the bus, and does NOT leak resources. Re-entry while an
+// earlier call is still in progress (concurrent call from another task) is
+// NOT supported and returns ESP_ERR_INVALID_STATE; serialize init on one task.
+//
+// Returns ESP_OK if the subsystem (already) started, even if some individual
+// sensors failed -- check the per-sensor *_ok flags via sensors_get().
 esp_err_t sensors_init(void);
 
 // Copy the latest readings into *out. Returns false if sensors_init()
@@ -73,10 +114,29 @@ bool sensors_get(sensors_data_t *out);
 
 // Pause/resume the internal poll task (stops all I2C sensor reads while
 // paused). Used to quiesce the single core during audio playback.
+//
+// SYNCHRONIZATION: this only stores a flag; it does NOT block and provides
+// no completion acknowledgement. The poll task observes the flag on its
+// next tick, after any I2C transaction already in flight has finished. The
+// pause is therefore ASYNCHRONOUS: on return, the shared I2C bus may still
+// be busy with one final sensor read, so it is NOT safe to start audio
+// traffic on the same bus immediately. Callers that need a hard quiesce
+// must wait at least one poll interval (or wait until the bus is idle)
+// after calling this before using the shared bus.
 void sensors_set_paused(bool paused);
 
 // Register a GET /metrics endpoint (Prometheus text format) on the given
 // HTTP server, exposing all sensor + battery values for scraping.
+//
+// `server` MUST be a live handle obtained from httpd_start() that the caller
+// guarantees will outlive this call; passing NULL or a handle being torn down
+// by httpd_stop() is undefined and the HTTP registration can fail silently.
+// Returns ESP_OK on success, or a non-OK esp_err_t (e.g. ESP_ERR_INVALID_ARG
+// for a NULL server, ESP_ERR_HTTPD_HANDLERS_FULL, or ESP_ERR_NO_MEM) if the
+// handler could not be registered. Callers MUST check the return value and
+// treat non-OK as "metrics endpoint unavailable": log it and continue -- the
+// rest of the sensor subsystem keeps working, the /metrics route is simply
+// absent. Never assume the route exists just because this was called.
 esp_err_t sensors_register_metrics(httpd_handle_t server);
 
 #ifdef __cplusplus
