@@ -71,7 +71,10 @@ static lv_obj_t *s_ov_tile = NULL;       // the Overview tile (landing target)
 static lv_obj_t *s_ov_climate = NULL;    // overview: local climate line
 static lv_obj_t *s_ov_batt = NULL;       // overview: battery line
 static lv_obj_t *s_ov_net = NULL;        // overview: connectivity line (wifi band + HA)
-static lv_obj_t *s_ov_ha = NULL;         // overview: HA summary line
+static lv_obj_t *s_ov_outdoor = NULL;    // overview: outdoor temp (Ute-Aquara, A17)
+static lv_obj_t *s_ov_elec_hdr = NULL;   // overview: "Electricity" heading (A17)
+static lv_obj_t *s_ov_wifi_box = NULL;   // overview: top-right WiFi strength icon (A17)
+static lv_obj_t *s_ov_wifi_bars[4] = {0};
 static lv_obj_t *s_ov_power = NULL;      // overview: solar/house power line (A16)
 static lv_obj_t *s_ov_time = NULL;       // overview: wall clock (HH:MM, SNTP)
 #define OV_LANDING_COL 0                 // Overview is tileview column 0
@@ -332,8 +335,9 @@ static void overview_timer_cb(lv_timer_t *t) {
         if (s_ov_batt) {
             bool bat_fresh = s.bat_ok && sensors_group_fresh_at(s.bat_last_us, rnow);
             if (bat_fresh) {
-                // SOC is uncalibrated -> label it estimated (honest).
-                lv_label_set_text_fmt(s_ov_batt, LV_SYMBOL_BATTERY_2 " %d%% (est)", s.bat_soc_pct);
+                // SOC is uncalibrated; the "(est)" suffix was dropped per
+                // UX request -- show the value only (no calibration claim).
+                lv_label_set_text_fmt(s_ov_batt, LV_SYMBOL_BATTERY_2 " %d%%", s.bat_soc_pct);
             } else {
                 lv_label_set_text(s_ov_batt, LV_SYMBOL_BATTERY_EMPTY " --");
             }
@@ -373,19 +377,17 @@ static void overview_timer_cb(lv_timer_t *t) {
                               band, ha_ok ? "ok" : "--");
     }
 
-    // HA summary: first configured temperature entity + its quality.
-    if (s_ov_ha) {
-        if (have_ha && hd.count > 0) {
-            const ha_sensor_t *h0 = &hd.sensors[0];
-            if (h0->ok) {
-                char hl[48];
-                snprintf(hl, sizeof(hl), "%s %.1f C", h0->name, h0->temp_c);
-                lv_label_set_text(s_ov_ha, hl);
-            } else {
-                lv_label_set_text_fmt(s_ov_ha, "%s --", h0->name);
-            }
+    // Outdoor temperature (A17): the first catalogue temperature entry is
+    // Ute-Aquara (catalogue/entities.yaml) -- the outdoor sensor. Shown as
+    // "Outdoor" rather than the raw entity name; replaces the old generic
+    // "first device temperature" summary line.
+    if (s_ov_outdoor) {
+        if (have_ha && hd.count > 0 && hd.sensors[0].ok) {
+            char hl[32];
+            snprintf(hl, sizeof(hl), "Outdoor %.1f C", hd.sensors[0].temp_c);
+            lv_label_set_text(s_ov_outdoor, hl);
         } else {
-            lv_label_set_text(s_ov_ha, "HA --");
+            lv_label_set_text(s_ov_outdoor, "Outdoor --");
         }
     }
 
@@ -409,10 +411,10 @@ static void overview_timer_cb(lv_timer_t *t) {
                                     "%s%u%s ", p->name, (unsigned)(p->temp_c + 0.5f), u);
                 }
             }
-            if (off == 0) lv_label_set_text(s_ov_power, "Effekt --");
+            if (off == 0) lv_label_set_text(s_ov_power, "--");
             else          lv_label_set_text(s_ov_power, pl);
         } else {
-            lv_label_set_text(s_ov_power, "Effekt --");
+            lv_label_set_text(s_ov_power, "--");
         }
     }
 
@@ -511,6 +513,22 @@ static void wifi_timer_cb(lv_timer_t *t) {
 static void wifi_anchor_bars(void) {
     if (s_wifi_box != NULL && s_bat_label != NULL) {
         lv_obj_align_to(s_wifi_box, s_bat_label, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+    }
+}
+
+// A17: recolour the Overview WiFi icon from the live RSSI (LVGL task).
+static void ov_wifi_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (s_ov_wifi_bars[0] == NULL) return;
+    wifi_ap_record_t ap;
+    int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+    int level = wifi_level_from_rssi(rssi);
+    for (int i = 0; i < 4; i++) {
+        bool on = (i < level);
+        lv_obj_set_style_bg_color(s_ov_wifi_bars[i],
+            lv_color_hex(on ? 0x90c0ff : 0x404040), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(s_ov_wifi_bars[i],
+            on ? LV_OPA_COVER : LV_OPA_50, LV_PART_MAIN);
     }
 }
 
@@ -808,6 +826,28 @@ static void build_test_ui(void) {
         lv_label_set_text(s_ov_time, "--:--");
         lv_obj_align(s_ov_time, LV_ALIGN_TOP_LEFT, 6, 8);
 
+        // A17: WiFi strength icon in the top-right corner (mirrors the page-1
+        // status-bar icon). ov_wifi_timer_cb recolours the bars from RSSI.
+        s_ov_wifi_box = lv_obj_create(tov);
+        lv_obj_remove_style_all(s_ov_wifi_box);
+        lv_obj_set_size(s_ov_wifi_box, 26, 14);
+        lv_obj_clear_flag(s_ov_wifi_box, LV_OBJ_FLAG_SCROLLABLE);
+        for (int i = 0; i < 4; i++) {
+            lv_obj_t *bar = lv_obj_create(s_ov_wifi_box);
+            lv_obj_remove_style_all(bar);
+            int h = 5 + i * 3;
+            lv_obj_set_size(bar, 5, h);
+            lv_obj_set_style_radius(bar, 1, LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(bar, lv_color_hex(0x404040), LV_PART_MAIN);
+            lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+            lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, i * 7, 0);
+            s_ov_wifi_bars[i] = bar;
+        }
+        lv_obj_align(s_ov_wifi_box, LV_ALIGN_TOP_RIGHT, -6, 8);
+        lv_timer_create(ov_wifi_timer_cb, 3000, NULL);
+        ov_wifi_timer_cb(NULL);
+
         // Connectivity line: WiFi band + a DISTINCT HA-reachable indicator
         // (signal strength != HA usable — review's explicit point).
         s_ov_net = lv_label_create(tov);
@@ -822,22 +862,31 @@ static void build_test_ui(void) {
         lv_obj_set_style_text_font(s_ov_climate, &lv_font_montserrat_14, LV_PART_MAIN);
         lv_label_set_text(s_ov_climate, "Climate\n--");
         lv_obj_set_style_text_align(s_ov_climate, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_align(s_ov_climate, LV_ALIGN_CENTER, 0, -24);
+        lv_obj_align(s_ov_climate, LV_ALIGN_TOP_MID, 0, 50);
 
-        // HA summary (first configured temperature) with freshness.
-        s_ov_ha = lv_label_create(tov);
-        lv_obj_set_style_text_color(s_ov_ha, lv_color_hex(0xc0c0c0), LV_PART_MAIN);
-        lv_obj_set_style_text_font(s_ov_ha, &lv_font_montserrat_14, LV_PART_MAIN);
-        lv_label_set_text(s_ov_ha, "HA --");
-        lv_obj_set_style_text_align(s_ov_ha, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_align(s_ov_ha, LV_ALIGN_CENTER, 0, 20);
+        // Outdoor temperature (A17): Ute-Aquara (first catalogue temperature
+        // entry). Replaces the old generic "first device temperature" line.
+        s_ov_outdoor = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_outdoor, lv_color_hex(0xffd060), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_outdoor, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_ov_outdoor, "Outdoor --");
+        lv_obj_set_style_text_align(s_ov_outdoor, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(s_ov_outdoor, LV_ALIGN_TOP_MID, 0, 106);
 
-        // Battery line.
+        // Electricity section heading (A17); the power line sits below it.
+        s_ov_elec_hdr = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_elec_hdr, lv_color_hex(0x808080), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_elec_hdr, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_label_set_text(s_ov_elec_hdr, "Electricity");
+        lv_obj_set_style_text_align(s_ov_elec_hdr, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(s_ov_elec_hdr, LV_ALIGN_TOP_MID, 0, 134);
+
+        // Battery at the bottom (A17).
         s_ov_batt = lv_label_create(tov);
         lv_obj_set_style_text_color(s_ov_batt, lv_color_hex(0x90c0ff), LV_PART_MAIN);
         lv_obj_set_style_text_font(s_ov_batt, &lv_font_montserrat_14, LV_PART_MAIN);
         lv_label_set_text(s_ov_batt, LV_SYMBOL_BATTERY_EMPTY " --");
-        lv_obj_align(s_ov_batt, LV_ALIGN_CENTER, 0, 52);
+        lv_obj_align(s_ov_batt, LV_ALIGN_BOTTOM_MID, 0, -66);
 
         // A16: solar/house power line, tucked between the climate and HA
         // lines. Montserrat 12 so "Sol 0W Hus 443W Idag 0.49kWh" fits.
@@ -845,8 +894,8 @@ static void build_test_ui(void) {
         lv_obj_set_style_text_color(s_ov_power, lv_color_hex(0xffd060), LV_PART_MAIN);
         lv_obj_set_style_text_font(s_ov_power, &lv_font_montserrat_12, LV_PART_MAIN);
         lv_obj_set_style_text_align(s_ov_power, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_label_set_text(s_ov_power, "Effekt --");
-        lv_obj_align(s_ov_power, LV_ALIGN_CENTER, 0, -2);
+        lv_label_set_text(s_ov_power, "--");
+        lv_obj_align(s_ov_power, LV_ALIGN_TOP_MID, 0, 154);
 
         // A05: sustained-comfort advisory (hidden until a rule is ACTIVE).
         s_ov_advisory = lv_label_create(tov);
@@ -854,7 +903,7 @@ static void build_test_ui(void) {
         lv_obj_set_style_text_font(s_ov_advisory, &lv_font_montserrat_14, LV_PART_MAIN);
         lv_label_set_text(s_ov_advisory, "");
         lv_obj_add_flag(s_ov_advisory, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_align(s_ov_advisory, LV_ALIGN_CENTER, 0, 80);
+        lv_obj_align(s_ov_advisory, LV_ALIGN_BOTTOM_MID, 0, -92);
 
         // I02: offline-timer status line (above the buttons).
         s_timer_label = lv_label_create(tov);
@@ -934,7 +983,7 @@ static void build_test_ui(void) {
     // spawns the worker task to play it.
     lv_obj_t *list = lv_obj_create(t0);
     lv_obj_set_size(list, 220, 150);
-    lv_obj_align(list, LV_ALIGN_CENTER, 0, 4);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 40);
     lv_obj_set_style_bg_color(list, lv_color_hex(0x181c22), LV_PART_MAIN);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(list, 4, LV_PART_MAIN);
@@ -958,15 +1007,15 @@ static void build_test_ui(void) {
     // Prev / page / Next row.
     lv_obj_t *prev = lv_btn_create(t0);
     lv_obj_set_size(prev, 50, 30);
-    lv_obj_align(prev, LV_ALIGN_CENTER, -78, 86);
+    lv_obj_align(prev, LV_ALIGN_TOP_MID, -55, 196);
     lv_obj_add_event_cb(prev, song_prev_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *pl = lv_label_create(prev); lv_label_set_text(pl, LV_SYMBOL_LEFT); lv_obj_center(pl);
     s_song_page_lbl = lv_label_create(t0);
     lv_obj_set_style_text_color(s_song_page_lbl, lv_color_hex(0xc0c0c0), LV_PART_MAIN);
-    lv_obj_align(s_song_page_lbl, LV_ALIGN_CENTER, -40, 86);
+    lv_obj_align(s_song_page_lbl, LV_ALIGN_TOP_MID, 0, 203);
     lv_obj_t *next = lv_btn_create(t0);
     lv_obj_set_size(next, 50, 30);
-    lv_obj_align(next, LV_ALIGN_CENTER, 0, 86);
+    lv_obj_align(next, LV_ALIGN_TOP_MID, 55, 196);
     lv_obj_add_event_cb(next, song_next_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *nl = lv_label_create(next); lv_label_set_text(nl, LV_SYMBOL_RIGHT); lv_obj_center(nl);
     song_render_page();   // fill the first page
@@ -974,7 +1023,7 @@ static void build_test_ui(void) {
     // Volume controls below the list.
     lv_obj_t *vol_dn = lv_btn_create(t0);
     lv_obj_set_size(vol_dn, 50, 34);
-    lv_obj_align(vol_dn, LV_ALIGN_CENTER, -70, 120);
+    lv_obj_align(vol_dn, LV_ALIGN_TOP_MID, -70, 234);
     lv_obj_add_event_cb(vol_dn, vol_down_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *vd = lv_label_create(vol_dn);
     lv_label_set_text(vd, LV_SYMBOL_DOWN);
@@ -982,12 +1031,12 @@ static void build_test_ui(void) {
 
     s_vol_label = lv_label_create(t0);
     lv_obj_set_style_text_color(s_vol_label, lv_color_hex(0xc0c0c0), LV_PART_MAIN);
-    lv_obj_align(s_vol_label, LV_ALIGN_CENTER, 0, 120);
+    lv_obj_align(s_vol_label, LV_ALIGN_TOP_MID, 0, 242);
     update_vol_label();
 
     lv_obj_t *vol_up = lv_btn_create(t0);
     lv_obj_set_size(vol_up, 50, 34);
-    lv_obj_align(vol_up, LV_ALIGN_CENTER, 70, 120);
+    lv_obj_align(vol_up, LV_ALIGN_TOP_MID, 70, 234);
     lv_obj_add_event_cb(vol_up, vol_up_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *vu = lv_label_create(vol_up);
     lv_label_set_text(vu, LV_SYMBOL_UP);
