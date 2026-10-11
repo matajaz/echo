@@ -25,10 +25,13 @@ extern "C" {
 #endif
 
 // Maximum number of temperature entities polled/displayed.
-#define HA_MAX_SENSORS 8
+#define HA_MAX_SENSORS 9
 // Maximum number of sensor-battery entities (the tile-4 sensors' battery
 // counterparts, device_class=battery). Displayed on the page AFTER the temps.
 #define HA_MAX_BATT 8
+// Maximum number of power/energy entities (device_class=power/energy) shown
+// on the K01 Overview: live solar W, live house W, solar energy today (kWh).
+#define HA_MAX_POWER 4
 // Bounded entity id / friendly-name length (kept short: they live in a
 // snapshot struct copied under a lock and shown on a small panel).
 #define HA_ENTITY_LEN 64
@@ -40,6 +43,7 @@ typedef struct {
     char name[HA_NAME_LEN];        // short display label
     float temp_c;                  // degrees Celsius; NAN when invalid
     bool ok;                       // true when the last fetch was a valid number
+    char unit[8];                  // display unit for power entries ("W"/"kWh")
 } ha_sensor_t;
 
 // Thread-safe snapshot of all configured entities.
@@ -50,6 +54,10 @@ typedef struct {
     // (separate HA objects). temp_c carries a PERCENT here, not a temperature.
     ha_sensor_t batteries[HA_MAX_BATT];
     int batt_count;         // number of configured battery entities
+    // Power/energy entities for the Overview (separate HA objects). temp_c
+    // carries W (power) or kWh (energy) depending on the catalogue entry.
+    ha_sensor_t power[HA_MAX_POWER];
+    int power_count;        // number of configured power entities
     bool started;           // poll task running
     bool wifi_up;          // last poll saw a live link (best-effort)
     int last_http_code;     // last HTTP status (or negative transport err)

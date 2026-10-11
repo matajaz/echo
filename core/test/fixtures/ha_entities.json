@@ -1,0 +1,91 @@
+{
+  "temperature": [
+    {
+      "id": "sensor.ute_aquara_temperatur",
+      "name": "Ute-Aquara"
+    },
+    {
+      "id": "sensor.ute_grund_temperatur",
+      "name": "Ute-Grund"
+    },
+    {
+      "id": "sensor.ute_temp3_temperatur",
+      "name": "Framsida"
+    },
+    {
+      "id": "sensor.oliver_sonoff_temperatur",
+      "name": "Oliver"
+    },
+    {
+      "id": "sensor.kok_sonoff_temperatur_2",
+      "name": "Kok"
+    },
+    {
+      "id": "sensor.badrum_temperatur",
+      "name": "Badrum"
+    },
+    {
+      "id": "sensor.vind_temperatur",
+      "name": "Vind"
+    },
+    {
+      "id": "sensor.dusch_temperatur",
+      "name": "Dusch"
+    },
+    {
+      "id": "sensor.vardagsrum_current_temperature",
+      "name": "V-rum"
+    }
+  ],
+  "battery": [
+    {
+      "id": "sensor.ute_aquara_batteri",
+      "name": "Ute-Aquara"
+    },
+    {
+      "id": "sensor.ute_grund_batteri",
+      "name": "Ute-Grund"
+    },
+    {
+      "id": "sensor.ute_temp3_batteri",
+      "name": "Framsida"
+    },
+    {
+      "id": "sensor.oliver_sonoff_batteri",
+      "name": "Oliver"
+    },
+    {
+      "id": "sensor.kok_sonoff_batteri_2",
+      "name": "Kok"
+    },
+    {
+      "id": "sensor.badrum_batteri",
+      "name": "Badrum"
+    },
+    {
+      "id": "sensor.vind_batteri",
+      "name": "Vind"
+    },
+    {
+      "id": "sensor.dusch_batteri",
+      "name": "Dusch"
+    }
+  ],
+  "power": [
+    {
+      "id": "sensor.nodered_84ed7654030307e4",
+      "name": "Sol",
+      "unit": "W"
+    },
+    {
+      "id": "sensor.tibber_pulse_blomsterkungsvagen_416_power",
+      "name": "Hus",
+      "unit": "W"
+    },
+    {
+      "id": "sensor.sol_produktion_dag",
+      "name": "Sol idag",
+      "unit": "kWh"
+    }
+  ]
+}

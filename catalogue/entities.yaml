@@ -1,0 +1,66 @@
+# echo HA entity catalogue (A15 — host-generated compile-time bindings).
+#
+# Single source of truth for the HA entities echo polls. `tools/gen_entities.py`
+# validates this and generates main/ha_entities.generated.h (the arrays that
+# ha_client.c compiles in) plus a fixture for host tests. Edit here, regenerate,
+# review the generated header, then build. Keep names short (fit the panel) and
+# entity_ids in the HA object-id form `domain.object_id`.
+#
+# Limits enforced by the generator (match ha_client.h):
+#   temperature: max 8 entries   battery: max 8 entries
+#   entity_id <= 63 chars        name <= 23 chars
+#
+# NOTE: tokens/credentials live ONLY in secrets/secrets.h, never here.
+
+version: 1
+
+temperature:
+  - id: sensor.ute_aquara_temperatur
+    name: Ute-Aquara
+  - id: sensor.ute_grund_temperatur
+    name: Ute-Grund
+  - id: sensor.ute_temp3_temperatur
+    name: Framsida
+  - id: sensor.oliver_sonoff_temperatur
+    name: Oliver
+  - id: sensor.kok_sonoff_temperatur_2
+    name: Kok
+  - id: sensor.badrum_temperatur
+    name: Badrum
+  - id: sensor.vind_temperatur
+    name: Vind
+  - id: sensor.dusch_temperatur
+    name: Dusch
+  - id: sensor.vardagsrum_current_temperature
+    name: V-rum
+
+battery:
+  - id: sensor.ute_aquara_batteri
+    name: Ute-Aquara
+  - id: sensor.ute_grund_batteri
+    name: Ute-Grund
+  - id: sensor.ute_temp3_batteri
+    name: Framsida
+  - id: sensor.oliver_sonoff_batteri
+    name: Oliver
+  - id: sensor.kok_sonoff_batteri_2
+    name: Kok
+  - id: sensor.badrum_batteri
+    name: Badrum
+  - id: sensor.vind_batteri
+    name: Vind
+  - id: sensor.dusch_batteri
+    name: Dusch
+
+# Power/energy tiles for the K01 Overview (A16). Values are W (live) or kWh
+# (energy today); the UI formats by index. entity_id form is the same.
+power:
+  - id: sensor.nodered_84ed7654030307e4
+    name: Sol
+    unit: W
+  - id: sensor.tibber_pulse_blomsterkungsvagen_416_power
+    name: Hus
+    unit: W
+  - id: sensor.sol_produktion_dag
+    name: Sol idag
+    unit: kWh

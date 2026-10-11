@@ -35,45 +35,21 @@ static const char *TAG = "ha_client";
 
 // Configured entities. EDIT THIS LIST (or generate it from a build macro)
 // to match your HA instance. entity_id is the HA object id; name is the
-// short label shown on the panel. This keeps the "which temperatures"
-// decision in one obvious place.
-typedef struct {
-    const char *entity_id;
-    const char *name;
-} ha_entity_cfg_t;
-
-static const ha_entity_cfg_t k_entities[] = {
-    {"sensor.ute_grund_temperatur",            "Ute-Grund"},
-    {"sensor.ute_temp3_temperatur",            "Framsida"},
-    {"sensor.oliver_sonoff_temperatur",        "Oliver"},
-    {"sensor.kok_sonoff_temperatur_2",         "Kok"},
-    {"sensor.badrum_temperatur",               "Badrum"},
-    {"sensor.vind_temperatur",                 "Vind"},
-    {"sensor.dusch_temperatur",                "Dusch"},
-    {"sensor.vardagsrum_current_temperature",  "V-rum"},
-};
-#define HA_CFG_COUNT ((int)(sizeof(k_entities) / sizeof(k_entities[0])))
-
-// Battery entities for the SAME physical sensors as k_entities, in the SAME
-// order so the two pages line up. These are separate HA objects (the Sonoff/
-// Zigbee battery_level diagnostic entities, device_class=battery). Verified
-// live against the HA instance 2026-10-11.
+// short label shown on the panel. The LIST ITSELF now lives in
+// catalogue/entities.yaml and is generated into ha_entities.generated.h by
+// tools/gen_entities.py (A15) — edit the catalogue + regenerate, don't hand-edit
+// the arrays. The generated type is ha_entity_def_t; we alias it so the rest of
+// this file (which refers to ha_entity_cfg_t) is unchanged.
 //
-// NOTE: k_entities has 8 rows but this list has 7 -- the V-rum temperature
-// sensor ("Vardagsrum Aktuell temperatur") exposes NO battery entity in HA
-// (confirmed: 0 of the 20 battery-class entities match it), so there is
-// nothing to show for it. Do not invent an id -- polling a non-existent
-// entity returns 404 and poisons last_http_code for the whole cycle.
-static const ha_entity_cfg_t k_batt_entities[] = {
-    {"sensor.ute_grund_batteri",       "Ute-Grund"},
-    {"sensor.ute_temp3_batteri",       "Framsida"},
-    {"sensor.oliver_sonoff_batteri",   "Oliver"},
-    {"sensor.kok_sonoff_batteri_2",    "Kok"},
-    {"sensor.badrum_batteri",          "Badrum"},
-    {"sensor.vind_batteri",            "Vind"},
-    {"sensor.dusch_batteri",           "Dusch"},
-};
+// NOTE preserved from the hand-written list: k_entities has 8 rows but
+// k_batt_entities has 7 — the V-rum temperature sensor exposes NO battery
+// entity in HA, so there is nothing to show for it. Do not invent an id — a
+// 404 poisons last_http_code for the whole cycle. (Keep the catalogue in sync.)
+#include "ha_entities.generated.h"
+typedef ha_entity_def_t ha_entity_cfg_t;
+#define HA_CFG_COUNT ((int)(sizeof(k_entities) / sizeof(k_entities[0])))
 #define HA_BATT_CFG_COUNT ((int)(sizeof(k_batt_entities) / sizeof(k_batt_entities[0])))
+#define HA_POWER_CFG_COUNT ((int)(sizeof(k_power_entities) / sizeof(k_power_entities[0])))
 
 static ha_data_t s_data;
 static SemaphoreHandle_t s_mtx = NULL;
@@ -259,6 +235,15 @@ static void poll_once(void) {
         s->temp_c = NAN;
         s->ok = false;
     }
+    d.power_count = (HA_POWER_CFG_COUNT < HA_MAX_POWER) ? HA_POWER_CFG_COUNT : HA_MAX_POWER;
+    for (int i = 0; i < d.power_count; i++) {
+        ha_sensor_t *s = &d.power[i];
+        strncpy(s->entity_id, k_power_entities[i].entity_id, sizeof(s->entity_id) - 1);
+        strncpy(s->name, k_power_entities[i].name, sizeof(s->name) - 1);
+        strncpy(s->unit, k_power_entities[i].unit, sizeof(s->unit) - 1);
+        s->temp_c = NAN;
+        s->ok = false;
+    }
 
     if (!wifi_up) {
         xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -343,6 +328,27 @@ static void poll_once(void) {
                 }
             }
         }
+
+        // Power/energy entities (device_class=power/energy) for the K01
+        // Overview. parse_state_temp is reused as the generic numeric
+        // extractor (NAN for unavailable/unknown); temp_c carries W (power)
+        // or kWh (energy) per the catalogue entry. Still the kept-alive
+        // client, so no extra connection.
+        for (int i = 0; i < d.power_count; i++) {
+            ha_sensor_t *s = &d.power[i];
+            int code = fetch_entity(client, s->entity_id, &hb);
+            last_code = code;
+            if (code == 200 && !hb.overflow) {
+                char state[64];
+                if (extract_state(hb.buf, state, sizeof(state))) {
+                    float v = parse_state_temp(state);
+                    if (!isnan(v)) {
+                        s->temp_c = v;
+                        s->ok = true;
+                    }
+                }
+            }
+        }
         esp_http_client_cleanup(client); // one close per cycle, not per entity
     } else {
         ESP_LOGW(TAG, "HA poll: client init failed");
@@ -354,8 +360,8 @@ static void poll_once(void) {
     s_data = d;
     xSemaphoreGive(s_mtx);
 
-    ESP_LOGI(TAG, "HA poll: %d entities + %d batteries, last_code=%d, wifi=%d",
-             d.count, d.batt_count, last_code, wifi_up);
+    ESP_LOGI(TAG, "HA poll: %d entities + %d batteries + %d power, last_code=%d, wifi=%d",
+             d.count, d.batt_count, d.power_count, last_code, wifi_up);
 }
 
 static void ha_poll_task(void *arg) {
@@ -449,6 +455,17 @@ esp_err_t ha_init(void) {
                 sizeof(d.batteries[i].name) - 1);
         d.batteries[i].temp_c = NAN;
         d.batteries[i].ok = false;
+    }
+    d.power_count = (HA_POWER_CFG_COUNT < HA_MAX_POWER) ? HA_POWER_CFG_COUNT : HA_MAX_POWER;
+    for (int i = 0; i < d.power_count; i++) {
+        strncpy(d.power[i].entity_id, k_power_entities[i].entity_id,
+                sizeof(d.power[i].entity_id) - 1);
+        strncpy(d.power[i].name, k_power_entities[i].name,
+                sizeof(d.power[i].name) - 1);
+        strncpy(d.power[i].unit, k_power_entities[i].unit,
+                sizeof(d.power[i].unit) - 1);
+        d.power[i].temp_c = NAN;
+        d.power[i].ok = false;
     }
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     s_data = d;

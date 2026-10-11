@@ -23,6 +23,7 @@
 #include "freertos/semphr.h"
 #include <math.h>
 #include <stdio.h>
+#include <time.h>
 
 static const char *TAG = "ui";
 
@@ -32,8 +33,14 @@ static const char *TAG = "ui";
 
 static lv_disp_t *s_disp = NULL;
 static lv_obj_t *s_vol_label = NULL;
+// Paginated song list (fixed-row: object count = viewport, NOT song count — so
+// the LVGL pool no longer caps the number of songs; v110 review memory fix #2).
+#define SONG_ROWS 5
+static lv_obj_t *s_song_rows[SONG_ROWS] = {0};   // fixed row buttons
+static lv_obj_t *s_song_row_lbls[SONG_ROWS] = {0};
+static lv_obj_t *s_song_page_lbl = NULL;
+static int s_song_page = 0;
 static lv_obj_t *s_bat_label = NULL;
-static lv_obj_t *s_sensor_label = NULL;
 static lv_obj_t *s_status_label = NULL;
 
 // Page 1 status bar: phone-style WiFi signal-strength icon (4 bars, left of
@@ -58,6 +65,52 @@ static lv_obj_t *s_ha_status = NULL;
 static lv_obj_t *s_batt_list = NULL;
 static lv_obj_t *s_batt_status = NULL;
 
+// K01 Overview + A11 idle return + I01 cleaning lock state.
+static lv_obj_t *s_tileview = NULL;      // the tileview (for programmatic nav)
+static lv_obj_t *s_ov_tile = NULL;       // the Overview tile (landing target)
+static lv_obj_t *s_ov_climate = NULL;    // overview: local climate line
+static lv_obj_t *s_ov_batt = NULL;       // overview: battery line
+static lv_obj_t *s_ov_net = NULL;        // overview: connectivity line (wifi band + HA)
+static lv_obj_t *s_ov_ha = NULL;         // overview: HA summary line
+static lv_obj_t *s_ov_power = NULL;      // overview: solar/house power line (A16)
+static lv_obj_t *s_ov_time = NULL;       // overview: wall clock (HH:MM, SNTP)
+#define OV_LANDING_COL 0                 // Overview is tileview column 0
+// A11: idle-return. last-activity monotonic ms; return to landing after idle.
+static uint32_t s_last_activity_ms = 0;
+static bool s_pin_here = false;          // "Keep here": opt out of idle return
+#define IDLE_RETURN_MS 120000u           // 2 min inactivity -> back to Overview
+// I01: cleaning lock. While active, touch is ignored (input disabled) and an
+// overlay shows a countdown; auto-unlocks at the deadline.
+static lv_obj_t *s_clean_overlay = NULL; // full-screen lock overlay
+static lv_obj_t *s_clean_label = NULL;   // countdown text
+static int64_t s_clean_until_us = 0;     // 0 = not locked
+#define CLEAN_LOCK_MS 30000              // 30 s wipe window
+
+// --- Milestone C: comfort rules (A05) + offline timer (I02) + dim/wake (K05) ---
+#include "comfort_rules.h"
+// A05: two local rules evaluated on the sensor path, visual-only advisory.
+static const comfort_rule_t s_rules[] = {
+    { "High humidity", COMFORT_ABOVE, 70.0f, 65.0f, 10u * 60u * 1000u }, // >=70% RH 10 min
+    { "Low temp",      COMFORT_BELOW, 15.0f, 17.0f, 10u * 60u * 1000u }, // <=15 C 10 min
+};
+#define N_RULES ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
+static comfort_rt_t s_rule_rt[N_RULES];
+static lv_obj_t *s_ov_advisory = NULL;   // overview advisory line
+
+// I02: offline monotonic timer. deadline_us is a monotonic esp_timer value;
+// WiFi/HA loss cannot affect it. 0 = no timer running.
+static int64_t s_timer_deadline_us = 0;
+static bool s_timer_fired = false;
+static lv_obj_t *s_timer_label = NULL;
+#define TIMER_PRESET_MS 300000           // 5 min preset
+
+// K05: dim the backlight after inactivity; first touch while dimmed is CONSUMED
+// (restores brightness, no underlying action). Civil-time schedule deferred.
+static bool s_dimmed = false;
+#define DIM_AFTER_MS 60000u              // dim after 60 s idle
+#define DIM_LEVEL 10                     // dimmed backlight %
+#define BRIGHT_LEVEL 100                 // normal backlight %
+
 // A single long-lived player task consumes play-requests. A song-list
 // press sets s_requested_index and (if something is playing) asks the
 // current song to stop early -- so pressing a new song interrupts the
@@ -67,14 +120,50 @@ static lv_obj_t *s_batt_status = NULL;
 // Song playback is now owned by the audio service (audio.c): the UI only
 // enqueues via audio_post_song() in song_btn_cb below. The former UI-owned
 // player_task + request-handoff machinery was removed (V03: single owner).
-// in-flight song first). The UI never calls blocking audio or touches I2C.
+// Paginated song list: a row's user-data is its ROW index (0..SONG_ROWS-1);
+// the stable song index is s_song_page*SONG_ROWS + row. Validated at tap time
+// so a shrunk list / stale page can't launch the wrong song.
+static void song_render_page(void) {
+    int total = audio_song_count();
+    int base = s_song_page * SONG_ROWS;
+    for (int r = 0; r < SONG_ROWS; r++) {
+        int idx = base + r;
+        if (!s_song_rows[r]) continue;
+        if (idx < total) {
+            const audio_song_t *song = audio_get_song(idx);
+            lv_label_set_text(s_song_row_lbls[r],
+                              song && song->name ? song->name : "?");
+            lv_obj_clear_flag(s_song_rows[r], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_song_rows[r], LV_OBJ_FLAG_HIDDEN);  // empty slot
+        }
+    }
+    if (s_song_page_lbl) {
+        int pages = (total + SONG_ROWS - 1) / SONG_ROWS;
+        if (pages < 1) pages = 1;
+        lv_label_set_text_fmt(s_song_page_lbl, "%d/%d", s_song_page + 1, pages);
+    }
+}
+
 static void song_btn_cb(lv_event_t *e) {
-    int index = (int)(intptr_t)lv_event_get_user_data(e);
-    const audio_song_t *song = audio_get_song(index);
-    ESP_LOGI(TAG, "song button pressed: %s", song ? song->name : "?");
-    if (!audio_post_song(index)) {
+    int row = (int)(intptr_t)lv_event_get_user_data(e);
+    int idx = s_song_page * SONG_ROWS + row;        // stable index at tap time
+    if (idx < 0 || idx >= audio_song_count()) return;  // guard shrunk/stale page
+    const audio_song_t *song = audio_get_song(idx);
+    ESP_LOGI(TAG, "song pressed: [%d] %s", idx, song ? song->name : "?");
+    if (!audio_post_song(idx)) {
         ESP_LOGW(TAG, "audio service busy/unavailable -- song request dropped");
     }
+}
+
+static void song_prev_cb(lv_event_t *e) {
+    (void)e;
+    if (s_song_page > 0) { s_song_page--; song_render_page(); }
+}
+static void song_next_cb(lv_event_t *e) {
+    (void)e;
+    int pages = (audio_song_count() + SONG_ROWS - 1) / SONG_ROWS;
+    if (s_song_page < pages - 1) { s_song_page++; song_render_page(); }
 }
 
 // Refresh the volume label from the codec's current level.
@@ -101,8 +190,279 @@ void ui_set_status(const char *text) {
     }
 }
 
-// Volume up/down -- audio_adjust_volume is fast (one I2C write), so it's
-// safe to call directly on the LVGL event task (unlike the blocking song).
+// ---- A11 idle-return + I01 cleaning lock + K05 dim/wake helpers (LVGL task) ----
+
+// K05: apply the backlight level for the current dim state (on the UI task, not
+// in a touch callback — I2C via board_backlight_set is fine here).
+static void ui_set_dim(bool dim) {
+    if (dim == s_dimmed) return;
+    s_dimmed = dim;
+    display_set_backlight(dim ? DIM_LEVEL : BRIGHT_LEVEL);
+}
+
+// Record user activity (resets the idle-return + dim timers).
+static void ui_note_activity(void) {
+    s_last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static bool ui_clean_locked(void) { return s_clean_until_us != 0; }
+
+// Global screen input observer.
+//   K05 wake-consume: if DIMMED, the first touch wakes the screen and is
+//     SWALLOWED (no underlying widget action), including the whole press→
+//     release→click stroke that started while dimmed (held finger can't act).
+//   A11 activity: any (non-waking) input resets the idle timer.
+static bool s_wake_swallow = false;   // true from a dimmed-press until its release
+static void ui_screen_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    bool is_input = (code == LV_EVENT_PRESSED || code == LV_EVENT_RELEASED ||
+                     code == LV_EVENT_CLICKED || code == LV_EVENT_GESTURE ||
+                     code == LV_EVENT_PRESSING);
+    if (!is_input) return;
+
+    if (code == LV_EVENT_PRESSED && s_dimmed) {
+        ui_set_dim(false);          // wake (restore brightness)
+        ui_note_activity();
+        s_wake_swallow = true;      // swallow the rest of THIS stroke
+        lv_event_stop_processing(e);
+        return;
+    }
+    if (s_wake_swallow) {
+        ui_note_activity();
+        if (code == LV_EVENT_RELEASED || code == LV_EVENT_CLICKED) {
+            s_wake_swallow = false; // stroke ended; next press acts normally
+        }
+        lv_event_stop_processing(e);
+        return;
+    }
+
+    ui_note_activity();     // A11: any (non-waking) input resets the idle timer
+}
+
+// I01: start the cleaning lock — a full-screen overlay that eats touches and
+// shows a countdown; auto-unlocks after CLEAN_LOCK_MS.
+static void ui_clean_lock_start(void) {
+    if (s_clean_overlay == NULL) return;
+    s_clean_until_us = esp_timer_get_time() + (int64_t)CLEAN_LOCK_MS * 1000;
+    lv_obj_clear_flag(s_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_clean_overlay);
+    ESP_LOGI(TAG, "cleaning lock: touch disabled for %d s", CLEAN_LOCK_MS / 1000);
+}
+
+static void ui_clean_lock_end(void) {
+    s_clean_until_us = 0;
+    if (s_clean_overlay) lv_obj_add_flag(s_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "cleaning lock: released");
+}
+
+static void clean_btn_cb(lv_event_t *e) {
+    (void)e;
+    ui_clean_lock_start();
+}
+
+// I02: start a preset timer if none running; cancel if one is. Monotonic
+// deadline (esp_timer) — unaffected by WiFi/HA/clock changes.
+static void timer_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (s_timer_deadline_us != 0) {               // running -> cancel
+        s_timer_deadline_us = 0;
+        s_timer_fired = false;
+        if (s_timer_label) lv_label_set_text(s_timer_label, LV_SYMBOL_BELL " Timer");
+        ESP_LOGI(TAG, "I02: timer cancelled");
+    } else {                                      // idle/fired -> (re)start
+        s_timer_fired = false;
+        s_timer_deadline_us = esp_timer_get_time() + (int64_t)TIMER_PRESET_MS * 1000;
+        ESP_LOGI(TAG, "I02: timer started (%d min)", TIMER_PRESET_MS / 60000);
+    }
+}
+
+// K01 overview refresh + I01 countdown + A11 idle-return (1 s cadence).
+static void overview_timer_cb(lv_timer_t *t) {
+    (void)t;
+    int64_t now_us = esp_timer_get_time();
+
+    // --- I01: cleaning-lock countdown ---
+    if (ui_clean_locked()) {
+        int64_t left_ms = (s_clean_until_us - now_us) / 1000;
+        if (left_ms <= 0) {
+            ui_clean_lock_end();
+        } else if (s_clean_label) {
+            lv_label_set_text_fmt(s_clean_label,
+                "Cleaning\nTouch locked\n\n%lld s", (long long)((left_ms + 999) / 1000));
+        }
+        return;   // while locked, don't refresh/return underneath the overlay
+    }
+
+    // Wall clock (SNTP). Only show real time once synced (year >= 2021); never
+    // fabricate time from uptime (review rule).
+    if (s_ov_time) {
+        time_t t = time(NULL);
+        struct tm tmv;
+        localtime_r(&t, &tmv);
+        if (tmv.tm_year + 1900 >= 2021) {
+            lv_label_set_text_fmt(s_ov_time, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+        } else {
+            lv_label_set_text(s_ov_time, "--:--");
+        }
+    }
+
+    // --- K01: refresh overview from existing snapshots (no new polling) ---
+    // NOTE: these snapshot structs are LARGE (sensors_data_t, and ha_data_t is
+    // ~1.7KB). They MUST be static, not stack locals — the LVGL task stack is
+    // only ~4KB and three ha_data_t copies here overflowed it (stack-protection
+    // panic after UI init). Single-task (LVGL timer), so static is safe.
+    uint64_t rnow = (uint64_t)now_us;
+    static sensors_data_t s;
+    static ha_data_t hd;
+    bool have_ha = ha_get(&hd);
+    if (sensors_get(&s)) {
+        bool th_fresh = sensors_group_fresh_at(s.th_last_us, rnow);
+        if (s_ov_climate) {
+            if (th_fresh) {
+                // LVGL's set_text_fmt has NO %f support -> format floats with
+                // libc snprintf, then pass the finished string via %s.
+                char cl[48];
+                snprintf(cl, sizeof(cl), "Climate\n%.1f C   %.0f%% RH\nfresh",
+                         s.temp_c, s.humidity_rh);
+                lv_label_set_text(s_ov_climate, cl);
+            } else {
+                lv_label_set_text(s_ov_climate, "Climate\n--\nunavailable");
+            }
+        }
+        if (s_ov_batt) {
+            bool bat_fresh = s.bat_ok && sensors_group_fresh_at(s.bat_last_us, rnow);
+            if (bat_fresh) {
+                // SOC is uncalibrated -> label it estimated (honest).
+                lv_label_set_text_fmt(s_ov_batt, LV_SYMBOL_BATTERY_2 " %d%% (est)", s.bat_soc_pct);
+            } else {
+                lv_label_set_text(s_ov_batt, LV_SYMBOL_BATTERY_EMPTY " --");
+            }
+        }
+
+        // A05: feed the comfort rules. 'valid' gates on th freshness so stale
+        // data can never trigger. Rule 0=humidity, rule 1=temperature.
+        uint32_t rnow_ms = (uint32_t)(now_us / 1000);
+        bool th_valid = sensors_group_fresh_at(s.th_last_us, rnow);
+        comfort_rule_update(&s_rules[0], &s_rule_rt[0], th_valid, s.humidity_rh, rnow_ms);
+        comfort_rule_update(&s_rules[1], &s_rule_rt[1], th_valid, s.temp_c, rnow_ms);
+    }
+
+    // A05: show the first ACTIVE advisory (or clear the line). Visual-only.
+    if (s_ov_advisory) {
+        const char *msg = NULL;
+        for (int i = 0; i < N_RULES; i++) {
+            if (s_rule_rt[i].state == COMFORT_ACTIVE) { msg = s_rules[i].label; break; }
+        }
+        if (msg) {
+            char a[40];
+            snprintf(a, sizeof(a), LV_SYMBOL_WARNING " %s", msg);
+            lv_label_set_text(s_ov_advisory, a);
+            lv_obj_clear_flag(s_ov_advisory, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_ov_advisory, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // Connectivity: WiFi band (signal) + a DISTINCT HA-reachable state.
+    if (s_ov_net) {
+        wifi_ap_record_t ap;
+        bool linked = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+        const char *band = !linked ? "offline" : (ap.primary >= 36 ? "5GHz" : "2.4GHz");
+        bool ha_ok = have_ha && hd.last_http_code == 200;
+        lv_label_set_text_fmt(s_ov_net, "WiFi %s  |  HA %s",
+                              band, ha_ok ? "ok" : "--");
+    }
+
+    // HA summary: first configured temperature entity + its quality.
+    if (s_ov_ha) {
+        if (have_ha && hd.count > 0) {
+            const ha_sensor_t *h0 = &hd.sensors[0];
+            if (h0->ok) {
+                char hl[48];
+                snprintf(hl, sizeof(hl), "%s %.1f C", h0->name, h0->temp_c);
+                lv_label_set_text(s_ov_ha, hl);
+            } else {
+                lv_label_set_text_fmt(s_ov_ha, "%s --", h0->name);
+            }
+        } else {
+            lv_label_set_text(s_ov_ha, "HA --");
+        }
+    }
+
+    // A16: solar + house power for the Overview, built from the ha_get()
+    // snapshot. Each entry carries its own unit (W live, kWh energy); W is
+    // shown integral, kWh with 2 decimals. Missing/stale values are skipped
+    // (never a fake 0) so a dead entity just drops out of the line.
+    if (s_ov_power) {
+        if (have_ha && hd.power_count > 0) {
+            char pl[80];
+            int off = 0;
+            for (int i = 0; i < hd.power_count && off < (int)sizeof(pl) - 16; i++) {
+                const ha_sensor_t *p = &hd.power[i];
+                if (!p->ok) continue;
+                const char *u = p->unit[0] ? p->unit : "";
+                if (u[0] == 'k') {
+                    off += snprintf(pl + off, sizeof(pl) - (size_t)off,
+                                    "%s%.2f%s ", p->name, p->temp_c, u);
+                } else {
+                    off += snprintf(pl + off, sizeof(pl) - (size_t)off,
+                                    "%s%u%s ", p->name, (unsigned)(p->temp_c + 0.5f), u);
+                }
+            }
+            if (off == 0) lv_label_set_text(s_ov_power, "Effekt --");
+            else          lv_label_set_text(s_ov_power, pl);
+        } else {
+            lv_label_set_text(s_ov_power, "Effekt --");
+        }
+    }
+
+    // --- I02: offline monotonic countdown timer ---
+    if (s_timer_label) {
+        if (s_timer_deadline_us != 0) {
+            int64_t left_us = s_timer_deadline_us - now_us;
+            if (left_us <= 0 && !s_timer_fired) {
+                s_timer_fired = true;
+                s_timer_deadline_us = 0;
+                lv_label_set_text(s_timer_label, LV_SYMBOL_BELL " Timer done!");
+                audio_post_tone(880, 400);   // optional chime via the audio owner
+                ESP_LOGI(TAG, "I02: timer fired");
+            } else if (left_us > 0) {
+                int secs = (int)((left_us + 999999) / 1000000);
+                lv_label_set_text_fmt(s_timer_label, LV_SYMBOL_BELL " %d:%02d",
+                                      secs / 60, secs % 60);
+            }
+        } else if (!s_timer_fired) {
+            lv_label_set_text(s_timer_label, LV_SYMBOL_BELL " Timer");
+        }
+    }
+
+    // --- K05: dim the backlight after inactivity (wake handled in the input cb) ---
+    {
+        uint32_t now_ms = (uint32_t)(now_us / 1000);
+        if (!s_dimmed && (uint32_t)(now_ms - s_last_activity_ms) >= DIM_AFTER_MS) {
+            ui_set_dim(true);
+        }
+    }
+
+    // --- A11: idle return to the landing tile ---
+    if (!s_pin_here && s_tileview && s_ov_tile) {
+        uint32_t now_ms = (uint32_t)(now_us / 1000);
+        if ((uint32_t)(now_ms - s_last_activity_ms) >= IDLE_RETURN_MS) {
+            // Only move if we're not already on the landing tile. Protected
+            // states (cleaning lock) already returned above; a pending/modal
+            // check could be added here if those gain explicit flags.
+            lv_obj_t *cur = lv_tileview_get_tile_act(s_tileview);
+            if (cur != s_ov_tile) {
+                lv_obj_set_tile(s_tileview, s_ov_tile, LV_ANIM_ON);
+                ESP_LOGI(TAG, "A11: idle %us -> returned to Overview",
+                         IDLE_RETURN_MS / 1000);
+            }
+            s_last_activity_ms = now_ms;   // avoid repeated moves every tick
+        }
+    }
+}
+
+// Volume up/down -- enqueued on the audio service (non-blocking).
 static void vol_up_cb(lv_event_t *e) {
     (void)e;
     audio_post_volume(+10);
@@ -162,8 +522,8 @@ static void bat_timer_cb(lv_timer_t *t) {
     if (s_bat_label == NULL) return;
     sensors_data_t d;
     bool have = sensors_get(&d);
-    uint32_t bat_now = (uint32_t)(esp_timer_get_time() / 1000);
-    bool bat_fresh = have && d.bat_ok && sensors_group_fresh_at(d.bat_last_ms, bat_now);
+    uint64_t bat_now = (uint64_t)esp_timer_get_time();
+    bool bat_fresh = have && d.bat_ok && sensors_group_fresh_at(d.bat_last_us, bat_now);
     if (bat_fresh) {
         // Pick an icon that matches the actual level (was always FULL).
         const char *icon;
@@ -183,39 +543,17 @@ static void bat_timer_cb(lv_timer_t *t) {
     // Sensor readout (same snapshot). NOTE: LVGL's lv_label_set_text_fmt
     // does NOT support %f (its printf is built without float), which
     // printed literal "%f"/"fff". Format floats with the full libc
-    // snprintf first, then pass the finished string via %s.
-    if (s_sensor_label != NULL) {
+    // Sensor freshness + chart feed. The textual sensor readout moved to the
+    // Overview (K01); the melody page no longer shows it. We still compute
+    // freshness here to feed the page-2 charts on the fixed 2 s grid.
+    {
         sensors_data_t s;
         if (sensors_get(&s)) {
-            // R10/V05a: distinguish fresh vs stale/never-read against the
-            // READER's current clock (not the producer's frozen publish-time
-            // now_ms — a stopped worker would otherwise read fresh forever).
-            uint32_t reader_now = (uint32_t)(esp_timer_get_time() / 1000);
-            bool th_fresh  = sensors_group_fresh_at(s.th_last_ms, reader_now);
-            bool imu_fresh = sensors_group_fresh_at(s.imu_last_ms, reader_now);
-            char tbuf[16], hbuf[16], abuf[40], gbuf[40];
-            if (th_fresh) {
-                snprintf(tbuf, sizeof(tbuf), "%.1f C", s.temp_c);
-                snprintf(hbuf, sizeof(hbuf), "%.0f%%", s.humidity_rh);
-            } else {
-                snprintf(tbuf, sizeof(tbuf), "--");
-                snprintf(hbuf, sizeof(hbuf), "--");
-            }
-            if (imu_fresh) {
-                snprintf(abuf, sizeof(abuf), "%.1f %.1f %.1f", s.accel_x, s.accel_y, s.accel_z);
-                snprintf(gbuf, sizeof(gbuf), "%.0f %.0f %.0f", s.gyro_x, s.gyro_y, s.gyro_z);
-            } else {
-                snprintf(abuf, sizeof(abuf), "--");
-                snprintf(gbuf, sizeof(gbuf), "--");
-            }
-            char txt[160];
-            snprintf(txt, sizeof(txt),
-                     "temp %s   hum %s\n"
-                     "accel %s\n"
-                     "gyro  %s",
-                     tbuf, hbuf, abuf, gbuf);
-            lv_label_set_text(s_sensor_label, txt);
-
+            // R10/V05a: freshness against the READER's current clock (not the
+            // producer's frozen publish-time), 64-bit µs (N10).
+            uint64_t reader_now = (uint64_t)esp_timer_get_time();
+            bool th_fresh  = sensors_group_fresh_at(s.th_last_us, reader_now);
+            bool imu_fresh = sensors_group_fresh_at(s.imu_last_us, reader_now);
             // V06: the chart is a FIXED 2 s wall-time grid (60 pts = 2 min, matching
             // the -2m/-1m/now labels). Append EXACTLY ONE point per series per tick
             // so the timebase stays honest: the current value when fresh, else an
@@ -403,12 +741,25 @@ static void info_timer_cb(lv_timer_t *t) {
     if (d > 0) snprintf(up_line, sizeof(up_line), "uptime: %dd %02d:%02d:%02d", d, h, m, s);
     else       snprintf(up_line, sizeof(up_line), "uptime: %02d:%02d:%02d", h, m, s);
 
-    // 9 short lines at Montserrat 12 fit the 240x320 panel without clipping.
+    // Last reset reason (user request): why did it last reboot?
+    const char *rr;
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   rr = "poweron";  break;
+        case ESP_RST_SW:        rr = "sw/ota";   break;
+        case ESP_RST_PANIC:     rr = "panic";    break;
+        case ESP_RST_TASK_WDT:  rr = "task_wdt"; break;
+        case ESP_RST_INT_WDT:   rr = "int_wdt";  break;
+        case ESP_RST_BROWNOUT:  rr = "brownout"; break;
+        default:                rr = "other";    break;
+    }
+    char rst_line[24];
+    snprintf(rst_line, sizeof(rst_line), "reset:  %s", rr);
+
     char txt[512];
     snprintf(txt, sizeof(txt),
-             "build:  %s\nidf:    %s\n%s\nssid:   %s\nip:     %s\n%s\nheap:   %u KB\n%s\n%s",
+             "build:  %s\nidf:    %s\n%s\nssid:   %s\nip:     %s\n%s\nheap:   %u KB\n%s\n%s\n%s",
              app->version, app->idf_ver, mac_line, ssid, ip, wifi_line,
-             heap_kb, up_line, ota_line);
+             heap_kb, up_line, rst_line, ota_line);
     lv_label_set_text(s_info_label, txt);
 }
 
@@ -418,44 +769,135 @@ static void build_test_ui(void) {
 
     lv_obj_t *tv = lv_tileview_create(scr);
     lv_obj_set_style_bg_color(tv, lv_color_hex(0x101418), LV_PART_MAIN);
-    // Page order (left -> right). Device info is FIRST, the home page
-    // (controls + song list) LAST, and the HA battery page sits right after
-    // the HA temperature page. The tileview shows column 0 first.
-    lv_obj_t *t5 = lv_tileview_add_tile(tv, 0, 0, LV_DIR_RIGHT);          // device info
+    // Page order (left -> right). K01: the OVERVIEW is now column 0 (the default
+    // landing the tileview shows first) — a glanceable home, not device info.
+    // Device info moves to the far right (support/health detail).
+    lv_obj_t *tov = lv_tileview_add_tile(tv, 0, 0, LV_DIR_RIGHT);         // K01 overview (landing)
     // Tile 1: the consolidated graph page (dropdown picks which metric).
     lv_obj_t *t1 = lv_tileview_add_tile(tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
     // Tile 4: Home Assistant temperatures (list of configured sensors).
     lv_obj_t *t4 = lv_tileview_add_tile(tv, 4, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
     // Tile 5: Home Assistant sensor batteries (same sensors as tile 4).
     lv_obj_t *tb = lv_tileview_add_tile(tv, 5, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    // Tile 0: home/controls + song list (now the last page).
-    lv_obj_t *t0 = lv_tileview_add_tile(tv, 6, 0, LV_DIR_LEFT);
+    // Tile 6: home/controls + song list.
+    lv_obj_t *t0 = lv_tileview_add_tile(tv, 6, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    // Tile 7: device info (support/health detail), now the last page.
+    lv_obj_t *t5 = lv_tileview_add_tile(tv, 7, 0, LV_DIR_LEFT);
     // Tiles must not scroll internally or they swallow the swipe gesture.
+    lv_obj_clear_flag(tov, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(t0, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(t1, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(t4, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tb, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(t5, LV_OBJ_FLAG_SCROLLABLE);
+    s_tileview = tv;
+    s_ov_tile = tov;
 
-    // ---- Tile 0: controls + readout ----
+    // ---- K01 Overview tile (default landing) ----
+    {
+        lv_obj_t *ot = lv_label_create(tov);
+        lv_label_set_text(ot, "Overview");
+        lv_obj_set_style_text_color(ot, lv_color_hex(0x30d070), LV_PART_MAIN);
+        lv_obj_set_style_text_font(ot, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_align(ot, LV_ALIGN_TOP_MID, 0, 8);
+
+        // Wall clock (SNTP). "--:--" until the first sync — never invent time.
+        s_ov_time = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_time, lv_color_hex(0xe0e0e0), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_time, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_ov_time, "--:--");
+        lv_obj_align(s_ov_time, LV_ALIGN_TOP_LEFT, 6, 8);
+
+        // Connectivity line: WiFi band + a DISTINCT HA-reachable indicator
+        // (signal strength != HA usable — review's explicit point).
+        s_ov_net = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_net, lv_color_hex(0x90c0ff), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_net, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_ov_net, "net --");
+        lv_obj_align(s_ov_net, LV_ALIGN_TOP_MID, 0, 34);
+
+        // Local climate (SHTC3) with explicit freshness/quality.
+        s_ov_climate = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_climate, lv_color_hex(0xe0e0e0), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_climate, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_ov_climate, "Climate\n--");
+        lv_obj_set_style_text_align(s_ov_climate, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(s_ov_climate, LV_ALIGN_CENTER, 0, -24);
+
+        // HA summary (first configured temperature) with freshness.
+        s_ov_ha = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_ha, lv_color_hex(0xc0c0c0), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_ha, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_ov_ha, "HA --");
+        lv_obj_set_style_text_align(s_ov_ha, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(s_ov_ha, LV_ALIGN_CENTER, 0, 20);
+
+        // Battery line.
+        s_ov_batt = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_batt, lv_color_hex(0x90c0ff), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_batt, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_ov_batt, LV_SYMBOL_BATTERY_EMPTY " --");
+        lv_obj_align(s_ov_batt, LV_ALIGN_CENTER, 0, 52);
+
+        // A16: solar/house power line, tucked between the climate and HA
+        // lines. Montserrat 12 so "Sol 0W Hus 443W Idag 0.49kWh" fits.
+        s_ov_power = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_power, lv_color_hex(0xffd060), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_power, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_align(s_ov_power, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_label_set_text(s_ov_power, "Effekt --");
+        lv_obj_align(s_ov_power, LV_ALIGN_CENTER, 0, -2);
+
+        // A05: sustained-comfort advisory (hidden until a rule is ACTIVE).
+        s_ov_advisory = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_ov_advisory, lv_color_hex(0xffc040), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_ov_advisory, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_ov_advisory, "");
+        lv_obj_add_flag(s_ov_advisory, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(s_ov_advisory, LV_ALIGN_CENTER, 0, 80);
+
+        // I02: offline-timer status line (above the buttons).
+        s_timer_label = lv_label_create(tov);
+        lv_obj_set_style_text_color(s_timer_label, lv_color_hex(0xc0d0e0), LV_PART_MAIN);
+        lv_obj_set_style_text_font(s_timer_label, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(s_timer_label, LV_SYMBOL_BELL " Timer");
+        lv_obj_align(s_timer_label, LV_ALIGN_BOTTOM_MID, 0, -42);
+
+        // Bottom row: Clean screen (I01) + Timer start/cancel (I02), side by side.
+        lv_obj_t *clean = lv_btn_create(tov);
+        lv_obj_set_size(clean, 112, 34);
+        lv_obj_align(clean, LV_ALIGN_BOTTOM_LEFT, 4, -2);
+        lv_obj_t *cl = lv_label_create(clean);
+        lv_label_set_text(cl, LV_SYMBOL_SETTINGS " Clean");
+        lv_obj_center(cl);
+        lv_obj_add_event_cb(clean, clean_btn_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *tmr = lv_btn_create(tov);
+        lv_obj_set_size(tmr, 112, 34);
+        lv_obj_align(tmr, LV_ALIGN_BOTTOM_RIGHT, -4, -2);
+        lv_obj_t *tl = lv_label_create(tmr);
+        lv_label_set_text(tl, LV_SYMBOL_BELL " 5 min");
+        lv_obj_center(tl);
+        lv_obj_add_event_cb(tmr, timer_btn_cb, LV_EVENT_CLICKED, NULL);
+    }
+
     lv_obj_t *title = lv_label_create(t0);
-    lv_label_set_text(title, "echo");
+    lv_label_set_text(title, "Melodies");
     lv_obj_set_style_text_color(title, lv_color_hex(0x30d070), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
-    s_bat_label = lv_label_create(t0);
+    // Item 4: battery + WiFi status icons now live on the Device-info page
+    // (t5), not the melody page. (A later step may add them to every page.)
+    s_bat_label = lv_label_create(t5);
     lv_obj_set_style_text_color(s_bat_label, lv_color_hex(0x90c0ff), LV_PART_MAIN);
     lv_obj_set_style_text_font(s_bat_label, &lv_font_montserrat_14, LV_PART_MAIN);
     lv_label_set_text(s_bat_label, LV_SYMBOL_BATTERY_EMPTY " --");
     lv_obj_align(s_bat_label, LV_ALIGN_TOP_RIGHT, -4, 2);
 
     // Phone-style WiFi signal-strength icon, left of the battery readout.
-    // Four bars of increasing height in a fixed 26x14 box, bottom-aligned;
-    // wifi_timer_cb recolours them from the live RSSI (fills left-to-right).
-    // The box is anchored to the battery label's LEFT edge (same mid-line)
-    // each time the battery text changes, so the varying label width can
-    // never push the icon under the battery glyph.
-    s_wifi_box = lv_obj_create(t0);
+    // wifi_timer_cb recolours the bars from the live RSSI; bat_timer_cb anchors
+    // the box to the battery label's left edge each refresh.
+    s_wifi_box = lv_obj_create(t5);
     lv_obj_remove_style_all(s_wifi_box);
     lv_obj_set_size(s_wifi_box, 26, 14);
     lv_obj_clear_flag(s_wifi_box, LV_OBJ_FLAG_SCROLLABLE);
@@ -485,33 +927,54 @@ static void build_test_ui(void) {
     lv_label_set_text(s_status_label, "");
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 30);
 
-    s_sensor_label = lv_label_create(t0);
-    lv_obj_set_style_text_color(s_sensor_label, lv_color_hex(0xd0d0d0), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_sensor_label, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_label_set_text(s_sensor_label, "sensors: ...");
-    lv_obj_align(s_sensor_label, LV_ALIGN_CENTER, 0, -60);
-    lv_obj_set_style_text_align(s_sensor_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    // (The sensor readout that used to live here moved to the Overview page.)
 
     // Scrollable song list -- one button per registered (public-domain)
     // song. Each button carries its song index as user-data; the callback
     // spawns the worker task to play it.
-    lv_obj_t *list = lv_list_create(t0);
-    lv_obj_set_size(list, 220, 120);
-    lv_obj_align(list, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_t *list = lv_obj_create(t0);
+    lv_obj_set_size(list, 220, 150);
+    lv_obj_align(list, LV_ALIGN_CENTER, 0, 4);
     lv_obj_set_style_bg_color(list, lv_color_hex(0x181c22), LV_PART_MAIN);
-    // Let vertical scroll work but still bubble horizontal swipes to the
-    // tileview (so page-swipe keeps working from the list).
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list, 4, LV_PART_MAIN);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(list, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    for (int i = 0; i < audio_song_count(); i++) {
-        const audio_song_t *song = audio_get_song(i);
-        lv_obj_t *b = lv_list_add_btn(list, LV_SYMBOL_AUDIO, song->name);
-        lv_obj_add_event_cb(b, song_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    // Fixed rows (viewport-bounded). Each row's user-data = ROW index; the
+    // stable song index is page*SONG_ROWS + row (see song_btn_cb).
+    for (int r = 0; r < SONG_ROWS; r++) {
+        lv_obj_t *b = lv_btn_create(list);
+        lv_obj_set_width(b, LV_PCT(100));
+        lv_obj_set_height(b, 26);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_event_cb(b, song_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)r);
+        lv_obj_t *l = lv_label_create(b);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_label_set_text(l, "--");
+        lv_obj_center(l);
+        s_song_rows[r] = b;
+        s_song_row_lbls[r] = l;
     }
+    // Prev / page / Next row.
+    lv_obj_t *prev = lv_btn_create(t0);
+    lv_obj_set_size(prev, 50, 30);
+    lv_obj_align(prev, LV_ALIGN_CENTER, -78, 86);
+    lv_obj_add_event_cb(prev, song_prev_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *pl = lv_label_create(prev); lv_label_set_text(pl, LV_SYMBOL_LEFT); lv_obj_center(pl);
+    s_song_page_lbl = lv_label_create(t0);
+    lv_obj_set_style_text_color(s_song_page_lbl, lv_color_hex(0xc0c0c0), LV_PART_MAIN);
+    lv_obj_align(s_song_page_lbl, LV_ALIGN_CENTER, -40, 86);
+    lv_obj_t *next = lv_btn_create(t0);
+    lv_obj_set_size(next, 50, 30);
+    lv_obj_align(next, LV_ALIGN_CENTER, 0, 86);
+    lv_obj_add_event_cb(next, song_next_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *nl = lv_label_create(next); lv_label_set_text(nl, LV_SYMBOL_RIGHT); lv_obj_center(nl);
+    song_render_page();   // fill the first page
 
     // Volume controls below the list.
     lv_obj_t *vol_dn = lv_btn_create(t0);
     lv_obj_set_size(vol_dn, 50, 34);
-    lv_obj_align(vol_dn, LV_ALIGN_CENTER, -70, 88);
+    lv_obj_align(vol_dn, LV_ALIGN_CENTER, -70, 120);
     lv_obj_add_event_cb(vol_dn, vol_down_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *vd = lv_label_create(vol_dn);
     lv_label_set_text(vd, LV_SYMBOL_DOWN);
@@ -519,12 +982,12 @@ static void build_test_ui(void) {
 
     s_vol_label = lv_label_create(t0);
     lv_obj_set_style_text_color(s_vol_label, lv_color_hex(0xc0c0c0), LV_PART_MAIN);
-    lv_obj_align(s_vol_label, LV_ALIGN_CENTER, 0, 88);
+    lv_obj_align(s_vol_label, LV_ALIGN_CENTER, 0, 120);
     update_vol_label();
 
     lv_obj_t *vol_up = lv_btn_create(t0);
     lv_obj_set_size(vol_up, 50, 34);
-    lv_obj_align(vol_up, LV_ALIGN_CENTER, 70, 88);
+    lv_obj_align(vol_up, LV_ALIGN_CENTER, 70, 120);
     lv_obj_add_event_cb(vol_up, vol_up_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *vu = lv_label_create(vol_up);
     lv_label_set_text(vu, LV_SYMBOL_UP);
@@ -612,6 +1075,29 @@ static void build_test_ui(void) {
     // Uptime ticks every second; the rest is effectively static.
     lv_timer_create(info_timer_cb, 1000, NULL);
     info_timer_cb(NULL); // paint immediately
+
+    // ---- I01 cleaning-lock overlay (hidden until invoked) ----
+    s_clean_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(s_clean_overlay);
+    lv_obj_set_size(s_clean_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_clean_overlay, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_clean_overlay, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_flag(s_clean_overlay, LV_OBJ_FLAG_HIDDEN);
+    s_clean_label = lv_label_create(s_clean_overlay);
+    lv_obj_set_style_text_color(s_clean_label, lv_color_hex(0x30d070), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_clean_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_clean_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_text(s_clean_label, "Cleaning\nTouch locked");
+    lv_obj_center(s_clean_label);
+
+    // A11: observe ALL input on the screen to reset the idle timer.
+    lv_obj_add_event_cb(lv_scr_act(), ui_screen_event_cb, LV_EVENT_ALL, NULL);
+    s_last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    // One timer drives the Overview refresh, the cleaning-lock countdown, and
+    // the idle-return check (1 s cadence — cheap, no new polling).
+    lv_timer_create(overview_timer_cb, 1000, NULL);
+    overview_timer_cb(NULL);
 }
 
 // NOTE: ui_init() returns only esp_err_t and keeps all UI state file-static
