@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.c" "ota.c" "display.c" "touch.c" "weblog.c" "ui.c" "sensors.c" "audio.c" "ha_client.c" "board_services.c"
+    SRCS "app_main.c" "ota.c" "display.c" "touch.c" "weblog.c" "ui.c" "ui_graphs.c" "sensors.c" "audio.c" "ha_client.c" "board_services.c"
     INCLUDE_DIRS "." "../secrets" "../core"
     EMBED_TXTFILES "certs/ota_ca.pem"
     REQUIRES

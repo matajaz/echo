@@ -1,6 +1,7 @@
 // echo -- LVGL UI layer. See ui.h for the design contract.
 
 #include "ui.h"
+#include "ui_graphs.h"
 
 #include "display.h"
 #include "esp_lvgl_port.h"
@@ -8,6 +9,8 @@
 #include "esp_app_desc.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "touch.h"
@@ -41,17 +44,8 @@ static lv_obj_t *s_status_label = NULL;
 static lv_obj_t *s_wifi_box = NULL;
 static lv_obj_t *s_wifi_bars[4] = {0};
 
-// Page 2 (temp/humidity) + page 3 (accel/gyro): one chart per quantity.
-static lv_obj_t *s_chart_temp = NULL;
-static lv_chart_series_t *s_ser_temp = NULL;
-static lv_obj_t *s_chart_hum = NULL;
-static lv_chart_series_t *s_ser_hum = NULL;
-static lv_obj_t *s_chart_acc = NULL;
-static lv_chart_series_t *s_ser_acc = NULL;
-static lv_obj_t *s_chart_gyro = NULL;
-static lv_chart_series_t *s_ser_gyro = NULL;
-static lv_obj_t *s_chart_soc = NULL;
-static lv_chart_series_t *s_ser_soc = NULL;
+// The five charts that used to live here (temp/hum/accel/gyro/SOC) are now
+// ONE selectable graph on the consolidated "graph" page (ui_graphs.c).
 
 // Page 4 (Home Assistant temperatures): a scrollable list, one row per
 // configured HA entity. Rows are rebuilt from the ha_get() snapshot by a
@@ -170,7 +164,7 @@ static void bat_timer_cb(lv_timer_t *t) {
     bool have = sensors_get(&d);
     uint32_t bat_now = (uint32_t)(esp_timer_get_time() / 1000);
     bool bat_fresh = have && d.bat_ok && sensors_group_fresh_at(d.bat_last_ms, bat_now);
-    if (have && d.bat_ok) {
+    if (bat_fresh) {
         // Pick an icon that matches the actual level (was always FULL).
         const char *icon;
         int p = d.bat_soc_pct;
@@ -183,11 +177,7 @@ static void bat_timer_cb(lv_timer_t *t) {
     } else {
         lv_label_set_text(s_bat_label, LV_SYMBOL_BATTERY_EMPTY " --");
     }
-    // V06: fixed 2 s grid — one point per tick; gap when not fresh.
-    if (s_chart_soc && s_ser_soc) {
-        lv_chart_set_next_value(s_chart_soc, s_ser_soc,
-            bat_fresh ? (int32_t)d.bat_soc_pct : LV_CHART_POINT_NONE);
-    }
+    // (Battery SOC graph is on the consolidated graph page now.)
     wifi_anchor_bars();   // label width just changed; keep bars to its left
 
     // Sensor readout (same snapshot). NOTE: LVGL's lv_label_set_text_fmt
@@ -232,26 +222,10 @@ static void bat_timer_cb(lv_timer_t *t) {
             // explicit gap (LV_CHART_POINT_NONE). Previously a stale group SKIPPED
             // insertion, which froze the chart and made the time labels lie; a fresh
             // group was sample-and-held onto the grid (correct for a fixed grid).
-            if (s_chart_temp && s_ser_temp) {
-                lv_chart_set_next_value(s_chart_temp, s_ser_temp,
-                    th_fresh ? (int32_t)(s.temp_c * 10) : LV_CHART_POINT_NONE);
-            }
-            if (s_chart_hum && s_ser_hum) {
-                lv_chart_set_next_value(s_chart_hum, s_ser_hum,
-                    th_fresh ? (int32_t)(s.humidity_rh) : LV_CHART_POINT_NONE);
-            }
-            if (s_chart_acc && s_ser_acc) {
-                float mag = sqrtf(s.accel_x * s.accel_x + s.accel_y * s.accel_y +
-                                  s.accel_z * s.accel_z);
-                lv_chart_set_next_value(s_chart_acc, s_ser_acc,
-                    imu_fresh ? (int32_t)(mag * 10) : LV_CHART_POINT_NONE);
-            }
-            if (s_chart_gyro && s_ser_gyro) {
-                float gmag = sqrtf(s.gyro_x * s.gyro_x + s.gyro_y * s.gyro_y +
-                                   s.gyro_z * s.gyro_z);
-                lv_chart_set_next_value(s_chart_gyro, s_ser_gyro,
-                    imu_fresh ? (int32_t)gmag : LV_CHART_POINT_NONE);
-            }
+            // Graphs moved to the dedicated page (ui_graphs.c samples
+            // sensors_get() itself, so no chart feeding is needed here).
+            (void)th_fresh;
+            (void)imu_fresh;
         }
     }
 }
@@ -353,65 +327,6 @@ static void batt_page_timer_cb(lv_timer_t *t) {
     }
 }
 
-// Create one labelled scrolling line-chart on a parent, return it and set
-// Rewrite the chart's X-axis tick labels to relative time. lv_chart has no
-// native time axis, so by default it just numbers the ticks (0, 1, 2...).
-// 60 points at one sample / 2 s = a 120 s window; with 3 major ticks the
-// labels become "-2m" (oldest) .. "-1m" .. "now" (newest).
-static void chart_x_time_labels_cb(lv_event_t *e) {
-    lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
-    if (dsc == NULL || dsc->text == NULL) return;
-    if (!(dsc->part == LV_PART_TICKS && dsc->id == LV_CHART_AXIS_PRIMARY_X)) return;
-    // dsc->value is the tick index (0..major_cnt-1); we set 3 majors.
-    switch (dsc->value) {
-        case 0: lv_snprintf(dsc->text, dsc->text_length, "-2m"); break;
-        case 1: lv_snprintf(dsc->text, dsc->text_length, "-1m"); break;
-        default: lv_snprintf(dsc->text, dsc->text_length, "now"); break;
-    }
-}
-
-// *ser to its series. point_cnt points, auto-ranged Y.
-typedef struct {
-    const char *title;   // axis/legend label
-    int y_off;           // vertical offset of the label (chart sits below)
-    uint32_t color_hex;  // series line color (lv_color_hex is not constexpr)
-    int ymin, ymax;      // Y-axis range; both axis-tick calls derive from it
-} chart_cfg_t;
-
-static lv_obj_t *make_chart(lv_obj_t *parent, const chart_cfg_t *cfg,
-                            lv_chart_series_t **ser) {
-    lv_obj_t *lbl = lv_label_create(parent);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xc0c0c0), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_label_set_text(lbl, cfg->title);
-    lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 6, cfg->y_off);
-
-    lv_obj_t *chart = lv_chart_create(parent);
-    lv_obj_set_size(chart, 200, 95);
-    lv_obj_align(chart, LV_ALIGN_TOP_MID, 8, cfg->y_off + 20);
-    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(chart, 60); // ~2 min at 2 s/sample
-    lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
-    lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, cfg->ymin, cfg->ymax);
-    // Axis tick marks + numeric labels. Y: 3 major ticks (min/mid/max) on
-    // the left; X: time ticks along the bottom (older <- -> newer).
-    lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_Y, 4, 2, 3, 1, true, 40);
-    // X axis: 3 major ticks; a draw callback rewrites their labels to
-    // relative time ("-2m".."now") since lv_chart has no native time axis.
-    lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_X, 4, 2, 3, 1, true, 24);
-    lv_obj_add_event_cb(chart, chart_x_time_labels_cb, LV_EVENT_DRAW_PART_BEGIN, NULL);
-    // Don't let the chart capture the swipe: charts are clickable+scrollable
-    // by default and "eat" the drag, so the tileview never sees the gesture
-    // (symptom: stuck on the graph page, can't swipe back). Make the chart
-    // transparent to input and bubble gestures up to the tileview.
-    lv_obj_clear_flag(chart, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(chart, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_flag(chart, LV_OBJ_FLAG_EVENT_BUBBLE);
-    *ser = lv_chart_add_series(chart, lv_color_hex(cfg->color_hex), LV_CHART_AXIS_PRIMARY_Y);
-    return chart;
-}
-
 // Build the UI: a 2-tile tileview (swipe left/right). Tile 0 = controls +
 // live readout, tile 1 = scrolling sensor graphs. Caller holds the LVGL
 // port lock.
@@ -473,16 +388,27 @@ static void info_timer_cb(lv_timer_t *t) {
         snprintf(wifi_line, sizeof(wifi_line), "wifi:   down");
     }
 
-    char txt[448];
-    if (d > 0) {
-        snprintf(txt, sizeof(txt),
-                 "build:  %s\nidf:    %s\nssid:   %s\nip:     %s\n%s\nuptime: %dd %02d:%02d:%02d\n%s",
-                 app->version, app->idf_ver, ssid, ip, wifi_line, d, h, m, s, ota_line);
-    } else {
-        snprintf(txt, sizeof(txt),
-                 "build:  %s\nidf:    %s\nssid:   %s\nip:     %s\n%s\nuptime: %02d:%02d:%02d\n%s",
-                 app->version, app->idf_ver, ssid, ip, wifi_line, h, m, s, ota_line);
+    // MAC address of the station interface (handy for DHCP/router lookups).
+    uint8_t mac[6] = {0};
+    char mac_line[28] = "mac:    --";
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        snprintf(mac_line, sizeof(mac_line), "mac:    %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
+
+    // Free heap (KB) -- the single most useful "is it healthy" number.
+    unsigned heap_kb = (unsigned)(esp_get_free_heap_size() / 1024u);
+
+    char up_line[32];
+    if (d > 0) snprintf(up_line, sizeof(up_line), "uptime: %dd %02d:%02d:%02d", d, h, m, s);
+    else       snprintf(up_line, sizeof(up_line), "uptime: %02d:%02d:%02d", h, m, s);
+
+    // 9 short lines at Montserrat 12 fit the 240x320 panel without clipping.
+    char txt[512];
+    snprintf(txt, sizeof(txt),
+             "build:  %s\nidf:    %s\n%s\nssid:   %s\nip:     %s\n%s\nheap:   %u KB\n%s\n%s",
+             app->version, app->idf_ver, mac_line, ssid, ip, wifi_line,
+             heap_kb, up_line, ota_line);
     lv_label_set_text(s_info_label, txt);
 }
 
@@ -496,9 +422,8 @@ static void build_test_ui(void) {
     // (controls + song list) LAST, and the HA battery page sits right after
     // the HA temperature page. The tileview shows column 0 first.
     lv_obj_t *t5 = lv_tileview_add_tile(tv, 0, 0, LV_DIR_RIGHT);          // device info
+    // Tile 1: the consolidated graph page (dropdown picks which metric).
     lv_obj_t *t1 = lv_tileview_add_tile(tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    lv_obj_t *t2 = lv_tileview_add_tile(tv, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    lv_obj_t *t3 = lv_tileview_add_tile(tv, 3, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
     // Tile 4: Home Assistant temperatures (list of configured sensors).
     lv_obj_t *t4 = lv_tileview_add_tile(tv, 4, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
     // Tile 5: Home Assistant sensor batteries (same sensors as tile 4).
@@ -508,9 +433,8 @@ static void build_test_ui(void) {
     // Tiles must not scroll internally or they swallow the swipe gesture.
     lv_obj_clear_flag(t0, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(t1, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(t2, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(t3, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(t4, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tb, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(t5, LV_OBJ_FLAG_SCROLLABLE);
 
     // ---- Tile 0: controls + readout ----
@@ -611,33 +535,8 @@ static void build_test_ui(void) {
     lv_label_set_text(hint, LV_SYMBOL_LEFT " swipe right");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
-    // ---- Tile 1: temperature + humidity ----
-    lv_obj_t *gt1 = lv_label_create(t1);
-    lv_obj_set_style_text_color(gt1, lv_color_hex(0x30d070), LV_PART_MAIN);
-    lv_label_set_text(gt1, LV_SYMBOL_LEFT " climate " LV_SYMBOL_RIGHT);
-    lv_obj_align(gt1, LV_ALIGN_TOP_MID, 0, 4);
-    static const chart_cfg_t temp_cfg = {"temp (0.1 C)", 30, 0xff8040, 150, 400};
-    static const chart_cfg_t hum_cfg = {"humidity %", 160, 0x40c0ff, 0, 100};
-    static const chart_cfg_t acc_cfg = {"accel |a| (0.1 m/s2)", 30, 0x40ff80, 0, 200};
-    static const chart_cfg_t gyro_cfg = {"gyro |w| (dps)", 160, 0xffd040, 0, 500};
-    static const chart_cfg_t soc_cfg = {"SOC %", 30, 0x90c0ff, 0, 100};
-    s_chart_temp = make_chart(t1, &temp_cfg, &s_ser_temp);
-    s_chart_hum = make_chart(t1, &hum_cfg, &s_ser_hum);
-
-    // ---- Tile 2: acceleration + gyro ----
-    lv_obj_t *gt2 = lv_label_create(t2);
-    lv_obj_set_style_text_color(gt2, lv_color_hex(0x30d070), LV_PART_MAIN);
-    lv_label_set_text(gt2, LV_SYMBOL_LEFT " motion");
-    lv_obj_align(gt2, LV_ALIGN_TOP_MID, 0, 4);
-    s_chart_acc = make_chart(t2, &acc_cfg, &s_ser_acc);
-    s_chart_gyro = make_chart(t2, &gyro_cfg, &s_ser_gyro);
-
-    // ---- Tile 3: battery state-of-charge ----
-    lv_obj_t *gt3 = lv_label_create(t3);
-    lv_obj_set_style_text_color(gt3, lv_color_hex(0x30d070), LV_PART_MAIN);
-    lv_label_set_text(gt3, LV_SYMBOL_LEFT " battery " LV_SYMBOL_RIGHT);
-    lv_obj_align(gt3, LV_ALIGN_TOP_MID, 0, 4);
-    s_chart_soc = make_chart(t3, &soc_cfg, &s_ser_soc);
+    // ---- Tile 1: consolidated graph page (one selectable graph) ----
+    ui_graphs_create(t1);
 
     // ---- Tile 4: Home Assistant temperatures ----
     // A scrollable list, one row per configured HA entity. The rows are
@@ -704,9 +603,12 @@ static void build_test_ui(void) {
 
     s_info_label = lv_label_create(t5);
     lv_obj_set_style_text_color(s_info_label, lv_color_hex(0xd0d0d0), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_info_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    // Montserrat 12 (not the default 14) so the extra rows fit vertically.
+    lv_obj_set_style_text_font(s_info_label, &lv_font_montserrat_12, LV_PART_MAIN);
     lv_label_set_text(s_info_label, "build: ...");
-    lv_obj_align(s_info_label, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_set_width(s_info_label, 232);
+    lv_label_set_long_mode(s_info_label, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_info_label, LV_ALIGN_LEFT_MID, 4, 0);
     // Uptime ticks every second; the rest is effectively static.
     lv_timer_create(info_timer_cb, 1000, NULL);
     info_timer_cb(NULL); // paint immediately

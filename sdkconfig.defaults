@@ -57,3 +57,9 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # audio, while aggregate heap looked huge (Sol's "DMA alloc can fail" warning,
 # 2026-10-10). 128 KB covers I2S + SPI-LCD DMA + WiFi internal needs.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=131072
+
+# --- LVGL fonts: enable smaller sizes so dense pages (device info, graph
+#     readouts) can shrink text to fit instead of clipping. Montserrat 14
+#     stays the default; 12/10 are used explicitly where space is tight. ---
+CONFIG_LV_FONT_MONTSERRAT_10=y
+CONFIG_LV_FONT_MONTSERRAT_12=y
