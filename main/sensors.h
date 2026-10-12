@@ -34,6 +34,8 @@ extern "C" {
 // or a stale rtc_ok. No external locking is required on the caller's side;
 // call sensors_get() directly from any task, callback, or HTTP handler.
 typedef struct {
+    uint32_t motion_seq;
+    uint64_t motion_last_us, accel_last_us;
     bool imu_ok;
     float accel_x, accel_y, accel_z; // m/s^2
     float gyro_x, gyro_y, gyro_z;    // deg/s
@@ -63,31 +65,25 @@ typedef struct {
     // (now_ms - *_last_ms) exceeds a threshold, and should render "--"
     // rather than a stale/zero value. now_ms is published alongside so a
     // single coherent snapshot can compute age without racing the clock.
-    uint32_t now_ms;        // esp_timer ms at publish time
-    uint32_t imu_last_ms;   // last good accel/gyro read
-    uint32_t th_last_ms;    // last good temp/humidity read
-    uint32_t rtc_last_ms;   // last good RTC read
-    uint32_t bat_last_ms;   // last good battery read
+    uint64_t now_us;        // esp_timer us at publish time (N10: 64-bit, no wrap alias)
+    uint64_t imu_last_us;   // last good accel/gyro read (0 = never)
+    uint64_t th_last_us;    // last good temp/humidity read
+    uint64_t rtc_last_us;   // last good RTC read
+    uint64_t bat_last_us;   // last good battery read
 } sensors_data_t;
 
 // Freshness threshold: a group whose last good read is older than this is
 // STALE. The poll runs every ~5 s, so 15 s = ~3 missed reads.
 #define SENSORS_STALE_MS 15000
 
-// V05a: freshness MUST be measured against the READER's current clock, not the
-// producer's publish-time now_ms. If the poll worker stops/parks after a good
-// publish, the stored now_ms freezes and (now_ms - last_ms) stays small forever
-// -> data looks fresh indefinitely. Callers pass esp_timer_get_time()/1000 read
-// at reader time. (Unsigned subtraction handles the ~49-day ms wrap.)
-static inline bool sensors_group_fresh_at(uint32_t last_ms, uint32_t reader_now_ms) {
-    return last_ms != 0 && (uint32_t)(reader_now_ms - last_ms) <= SENSORS_STALE_MS;
-}
-
-// DEPRECATED (V05a): compares against the producer's frozen publish-time, so a
-// stopped worker reads fresh forever. Prefer sensors_group_fresh_at() with a
-// reader-time clock. Retained only so existing callers compile.
-static inline bool sensors_group_fresh(uint32_t last_ms, uint32_t now_ms) {
-    return last_ms != 0 && (uint32_t)(now_ms - last_ms) <= SENSORS_STALE_MS;
+// V05a + N10: freshness is measured against the READER's current MONOTONIC
+// clock in MICROSECONDS (esp_timer_get_time()), not the producer's frozen
+// publish-time (a stopped worker would otherwise read fresh forever), and in
+// 64-bit so a 32-bit ms rollover (~49.7 days) can never alias an old sample as
+// fresh. last_us==0 means "never stamped".
+static inline bool sensors_group_fresh_at(uint64_t last_us, uint64_t reader_now_us) {
+    if (last_us == 0 || reader_now_us < last_us) return false;
+    return (reader_now_us - last_us) <= (uint64_t)SENSORS_STALE_MS * 1000ull;
 }
 
 // Bring up all three sensors on the shared I2C bus and start the poll
@@ -142,3 +138,7 @@ esp_err_t sensors_register_metrics(httpd_handle_t server);
 #ifdef __cplusplus
 }
 #endif
+
+// NTP callback only publishes a flag; RTC writes run on the sensor owner.
+void sensors_clock_synced(void);
+const char *sensors_clock_source(void);

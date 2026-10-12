@@ -69,5 +69,14 @@ toomany = "version: 1\ntemperature:\n" + "".join(
     f"  - id: sensor.s{i}\n    name: S{i}\n" for i in range(10))
 expect_error("too many entries (>9)", toomany)
 
+for section, limit in (("battery", 8), ("power", 6)):
+    items = f"version: 1\n{section}:\n" + "".join(
+        f"  - id: sensor.s{i}\n    name: S{i}\n" for i in range(limit + 1))
+    expect_error(f"{section} over capacity", items)
+expect_error("power missing role", "version: 1\npower:\n  - id: sensor.grid\n    name: Grid\n    unit: W\n")
+expect_error("power wrong unit", "version: 1\npower:\n  - id: sensor.grid\n    name: Grid\n    role: grid_power\n    unit: kWh\n")
+expect_ok("power renamed, role stable", "version: 1\npower:\n  - id: sensor.grid\n    name: Arbitrary name\n    role: grid_power\n    unit: W\n")
+expect_error("unicode too many bytes", GOOD.replace("name: Living", "name: " + "å" * 12))
+expect_error("unescaped backslash", GOOD.replace("name: Living", "name: Living\\room"))
 print(f"=== {_PASS} passed, {_FAIL} failed ===")
 sys.exit(1 if _FAIL else 0)

@@ -1,9 +1,9 @@
 // echo -- audio output via the ES8311 codec (I2S + esp_codec_dev).
 //
-// Hardware (verified against the vendor BSP
-// esp32_c5_touch_lcd_2.8.{c,h}, not guessed):
+// Hardware directions verified against the board schematic. The older vendor
+// BSP labels DOUT/DSIN incorrectly; codec ASDOUT is an ESP input, not an output.
 //   - Codec: ES8311 on the shared I2C bus (ES8311_CODEC_DEFAULT_ADDR).
-//   - I2S: SCLK=GPIO24, WS/LRCK=GPIO25, DOUT=GPIO26, DSIN=GPIO27,
+//   - I2S: SCLK=GPIO24, WS/LRCK=GPIO25, ESP DOUT=GPIO27, ESP DIN=GPIO26,
 //     MCLK=none (ES8311 use_mclk=false -- runs off BCLK), I2S_NUM_0,
 //     master, 16-bit, Philips slot.
 //   - Power amplifier (NS4150-class) enable: CH32 expander pin
@@ -20,79 +20,12 @@
 extern "C" {
 #endif
 
-// ---------------------------------------------------------------------------
-// THREADING / OWNERSHIP CONTRACT -- read this before calling anything below
-// ---------------------------------------------------------------------------
-// This module owns the codec handle, the I2S channels and the output volume,
-// and playback blocks for seconds (a whole song). The rules:
-//
-//  1. ONE OWNER. Exactly ONE task -- the module's audio task -- drives this
-//     module: audio_init(), audio_play_tone(), audio_play_song() and the
-//     volume accessors are all issued from it (or by a caller that has
-//     already serialized on the audio mutex itself). No other task may call
-//     them, because a second caller would interleave codec open/close/write
-//     and volume sets on the same DMA.
-//     The audio task is PRIVATE to this module: audio_init() (in audio.c)
-//     creates and owns it, and it is deliberately not exposed here. Callers
-//     (e.g. ui.c) honor rule 1 by enqueueing work onto that task; they must
-//     not spawn their own task to drive this interface.
-//     ENFORCEMENT: the shared codec handle, the volume level and the
-//     playback sample buffer are additionally guarded by a module-internal
-//     mutex held at the top of audio_play_tone()/audio_play_song() and
-//     released only via the shared playback_finalize() path, and by the
-//     volume accessors. A concurrent caller therefore blocks rather than
-//     corrupting codec/sample-info state; the serialization rules above are
-//     still the intended usage.
-//
-//  2. NOT RE-ENTRANT. audio_play_tone()/audio_play_song() block until the
-//     last sample has drained and the codec has been closed. Never call them
-//     from the LVGL task, from an ISR/timer callback, or re-entrantly from
-//     anywhere inside this module.
-//
-//  3. LIFECYCLE. The volume accessors are only meaningful AFTER
-//     audio_init() has returned ESP_OK and BEFORE any teardown: calling them
-//     while audio_init() is still creating the codec, or while a playback is
-//     closing it, races the codec handle. Rule (1) is what makes that
-//     impossible -- there is no concurrent init/deinit path.
-//     SINGLE-SHOT: this module is deliberately one-way for the lifetime of
-//     the process. There is NO audio_deinit()/teardown entry point -- I2S
-//     channels, the codec handle and the PA enable are never released once
-//     acquired. A restart/re-init flow must reboot the device rather than
-//     tear down and rebuild the audio stack; do not expect a second
-//     audio_init() to free an earlier instance.
-//
-//  4. LOCK ORDERING. If a caller adds its own locking instead of routing
-//     through the audio task, the audio lock is the INNERMOST (leaf) lock:
-//     take the display/I2C (and any UI) lock FIRST, then the audio lock,
-//     never the reverse -- audio_init() likewise resolves its
-//     display_get_i2c_bus()/display_get_io_expander() handles before it
-//     touches the codec. Never hold the audio lock across
-//     audio_play_song(): it blocks for seconds and would stall volume
-//     changes behind it.
-//
-// Bring up I2S + the ES8311 codec and enable the speaker PA. Requires
-// display_init() to have succeeded (reuses its shared I2C bus + CH32
-// expander handle). Non-fatal to the rest of the system.
-//
-// LIFECYCLE (THREADING rule 1): this is the entry point that CREATES and
-// owns the private audio task, so it must NOT be called from that task --
-// call it once from a startup task before any other function here. It is
-// idempotent: a second call returns ESP_OK without rebuilding an earlier
-// instance (see SINGLE-SHOT above).
+// Initialize once from startup. Thereafter callers enqueue commands; the
+// priority-20 audio service alone owns codec I/O, gain and session teardown.
+// Snapshot getters are thread-safe and nonblocking. Enqueue calls are safe
+// from tasks (not ISRs), bounded, and have no side effects when rejected.
 esp_err_t audio_init(void);
-
-// Play a short sine-wave test tone (blocking) at the given frequency and
-// duration, so audio output is verifiable by ear. Returns ESP_OK if the
-// tone was written. No-op error if audio_init() hasn't succeeded.
-// Serialized with audio_play_song(): the audio task must not have another
-// playback in flight, or the tone blocks until that playback has drained and
-// closed the codec.
-//
-// STOP SEMANTICS (asymmetry vs. audio_play_song): a tone is short and is
-// NOT interruptible -- it does not consult the cancel generation, so an
-// audio_request_stop() issued while a tone plays has no effect on it. Only
-// audio_play_song() honors audio_request_stop() (at note boundaries). Callers
-// that need cancellable audio must use audio_play_song()/the song path.
+// Blocking executor APIs: reserved for the audio service, never a UI callback.
 esp_err_t audio_play_tone(uint32_t freq_hz, uint32_t duration_ms);
 
 // A single note: frequency in Hz (0 = rest) and duration in ms.
@@ -115,74 +48,37 @@ typedef struct {
 int audio_song_count(void);
 const audio_song_t *audio_get_song(int index);
 
-// Play song `index` from the registry (blocking, a few seconds). Uses the
-// click-free engine (per-note raised-cosine envelope, continuous phase,
-// large write chunks, DMA drain before close). Safe no-op error if audio
-// isn't initialized or the index is out of range. Run it OFF the LVGL
-// task (its own FreeRTOS task) since it blocks for the whole tune.
-//
-// SERIALIZATION (THREADING rule 1): playback is issued from, and completed
-// by, the single audio task. A song never overlaps another playback -- the
-// previous one has drained its DMA and closed the codec before this one
-// opens it. Enqueue the request on that task; if you need the previous tune
-// gone first, call audio_request_stop() and let the task finish unwinding
-// (it returns only after the drain + close) before starting the next song.
 esp_err_t audio_play_song(int index);
-
-// Request that an in-progress song stop early (checked at note boundaries,
-// then drains cleanly). Used so a new song press can interrupt the current
-// one. No-op if nothing is playing.
-//
-// STOP-COMPLETION: audio_request_stop() is ASYNCHRONOUS and non-blocking --
-// it only bumps the cancel generation, so it returns long before the current
-// playback has actually drained and closed the codec. That makes it safe to
-// call from ANY task (including the UI task), and a stop that lands just
-// before a new song starts is never lost. It does NOT provide a
-// stop-AND-WAIT guarantee: do not treat it as "the song has stopped" before
-// the audio task has returned from audio_play_song().
-//
-// MEMORY ORDERING: the cancel generation and the playing flag are shared
-// across tasks on the SMP ESP32-C5. They are read/written atomically (single
-// aligned word) and both are declared volatile in audio.c so the compiler
-// cannot cache them across the polling loop; the audio task re-reads the
-// generation on every iteration. There is still no ordering barrier pairing
-// audio_request_stop() with audio_is_playing(), so do not use the flag as a
-// full memory fence for other state -- it only reports playback liveness.
-void audio_request_stop(void);
-
-// Playback-state query. Because audio_request_stop() is asynchronous and
-// audio_play_song() blocks for seconds, this is the non-blocking way for
-// another task (e.g. the UI) to observe when playback has actually finished:
-// it returns true while a song is in flight and false once the audio task
-// has drained the DMA and closed the codec. The flag is owned and updated by
-// the audio task only (THREADING rule 1). Safe to call from any task.
+void audio_request_stop(void); // atomic asynchronous cancellation
 bool audio_is_playing(void);
-
-// Volume control (0-100%). audio_adjust_volume clamps the result to
-// [0,100], applies it to the codec, and returns the new level (or -1 if
-// audio isn't initialized). audio_get_volume returns the current level, or
-// -1 if audio isn't initialized -- callers cannot otherwise distinguish a
-// genuine 0% from a failure, so check for -1 rather than assuming >= 0.
-// Valid only after audio_init() has returned ESP_OK and while the audio task
-// is alive (THREADING rule 3): the level is owned by the audio task, so a
-// volume change can never race init, playback or teardown of the codec.
-int audio_get_volume(void);
-int audio_adjust_volume(int delta);
-
-// --- Command-owner service (review order 5) --------------------------------
-// Preferred API for callers (UI, app_main): ENQUEUE a command onto the audio
-// service task, which is the sole codec driver. Non-blocking; safe from ANY
-// task (including the LVGL task) — no I2C/codec is touched by the caller.
-// Latest-play: a new tone/song cancels an in-flight song first. Returns false
-// if audio isn't initialized or the bounded queue is full.
-#include "audio_cmd.h"   // audio_status_t / audio_state_t (host-tested policy)
+int audio_get_volume(void); // -1 until the service is ready
+int audio_adjust_volume(int delta); // executor-only
+#include "audio_cmd.h"
 bool audio_post_song(int index);
 bool audio_post_tone(uint32_t freq_hz, uint32_t duration_ms);
 bool audio_post_stop(void);
 bool audio_post_volume(int delta);
+bool audio_post_volume_absolute(int volume);
 bool audio_post_mute(bool mute);
-// Snapshot the observable playback state (F08: stop/mute/playback feedback).
+bool audio_post_wav(const char *name);
 void audio_get_status(audio_status_t *out);
+
+// Compact diagnostic for /info (debuggable without serial): writes
+// *service_ready (audio_init fully succeeded + task live), *codec_ok (codec
+// handle present), *volume (desired %), *muted, *last_error (0 = none).
+void audio_diag(bool *service_ready, bool *codec_ok, int *volume, bool *muted,
+                int *last_error);
+int audio_diag_last_cmd(void);   // last accepted command id (advances per accepted cmd)
+int audio_diag_state(void);      // audio_state_t as int
+int audio_pa_reassert_read(void); // last amplifier-enable result; does not change hardware
+int audio_read_codec_regs(void);  // ES8311 regs 0x0D/0x12/0x32 packed, -1 fail
+// Cached by the codec owner after opening and while writing actual PCM.
+// Reading this snapshot never takes the playback lock or touches I2C.
+typedef struct {
+    uint32_t samples, nonzero_samples, peak, sample_rate;
+    int pa_level, pa_error, codec_regs, clock1, clock2, format, mute_reg;
+} audio_path_diag_t;
+void audio_get_path_diag(audio_path_diag_t *out);
 
 #ifdef __cplusplus
 }

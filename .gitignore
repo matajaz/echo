@@ -8,3 +8,8 @@ factory/*.bin
 managed_components/
 dependencies.lock
 deploy-log.jsonl
+
+# New host-test outputs (existing user artifacts are preserved).
+core/test/test_review
+core/test/test_review.dSYM/
+core/test/cjson_test.o

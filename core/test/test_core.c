@@ -10,6 +10,7 @@
 #include "../readiness.h"
 #include "../ota_identity.h"
 #include "../audio_cmd.h"
+#include "../comfort_rules.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -23,27 +24,38 @@ static int g_fail = 0, g_pass = 0;
 // ---------- sample model (V05/V06) ----------
 static void test_sample_model(void) {
     printf("sample_model:\n");
+    const uint32_t W = SAMPLE_STALE_MS_DEFAULT;      // 15000 ms window
     sample_health_t h = {0};
-    // never read -> UNKNOWN, not fresh
-    CHECK(sample_quality(&h, 1000, SAMPLE_STALE_MS_DEFAULT, false) == SAMPLE_UNKNOWN, "unread=UNKNOWN");
-    CHECK(!sample_is_fresh(&h, 1000, SAMPLE_STALE_MS_DEFAULT), "unread not fresh");
+    // never read -> UNKNOWN, not fresh (times are microseconds now)
+    CHECK(sample_quality(&h, 1000000ull, W, false) == SAMPLE_UNKNOWN, "unread=UNKNOWN");
+    CHECK(!sample_is_fresh(&h, 1000000ull, W), "unread not fresh");
 
-    // good read at t=1000; fresh at t=5000 (<15s), stale at t=20000 (V05a:
-    // reader clock advances even though the producer stopped stamping)
-    sample_mark_good(&h, 1000);
+    // good read at t=1s; fresh at t=5s (<15s), stale at t=20s. Reader clock
+    // advances even though the producer stopped stamping (V05a).
+    sample_mark_good(&h, 1000000ull);
     CHECK(h.sequence == 1 && h.ever_good, "mark_good bumps seq");
-    CHECK(sample_is_fresh(&h, 5000, SAMPLE_STALE_MS_DEFAULT), "fresh within window");
-    CHECK(!sample_is_fresh(&h, 20000, SAMPLE_STALE_MS_DEFAULT), "stopped producer expires (V05a)");
-    CHECK(sample_quality(&h, 20000, SAMPLE_STALE_MS_DEFAULT, false) == SAMPLE_STALE, "stale verdict");
+    CHECK(sample_is_fresh(&h, 5000000ull, W), "fresh within window");
+    CHECK(!sample_is_fresh(&h, 20000000ull, W), "stopped producer expires (V05a)");
+    CHECK(sample_quality(&h, 20000000ull, W, false) == SAMPLE_STALE, "stale verdict");
 
     // estimated (uncalibrated battery) degrades FRESH->ESTIMATED but not STALE
-    CHECK(sample_quality(&h, 5000, SAMPLE_STALE_MS_DEFAULT, true) == SAMPLE_ESTIMATED, "estimated degrades fresh");
-    CHECK(sample_quality(&h, 20000, SAMPLE_STALE_MS_DEFAULT, true) == SAMPLE_STALE, "estimated stays stale when old");
+    CHECK(sample_quality(&h, 5000000ull, W, true) == SAMPLE_ESTIMATED, "estimated degrades fresh");
+    CHECK(sample_quality(&h, 20000000ull, W, true) == SAMPLE_STALE, "estimated stays stale when old");
 
-    // 49.7-day ms wrap: last good just below wrap, now just above -> delta small
-    sample_health_t w = {0};
-    sample_mark_good(&w, 0xFFFFF000u);
-    CHECK(sample_is_fresh(&w, 0x00000100u, SAMPLE_STALE_MS_DEFAULT), "ms-wrap stays fresh across rollover");
+    // N10: a sample stamped at monotonic time ZERO is VALID (ever_good, not a
+    // zero sentinel) and fresh within the window.
+    sample_health_t z = {0};
+    sample_mark_good(&z, 0ull);
+    CHECK(z.ever_good, "t=0 sample is ever_good");
+    CHECK(sample_is_fresh(&z, 5000000ull, W), "t=0 sample is fresh (no zero sentinel, N10)");
+
+    // N10: no 49.7-day alias. A sample from just below a 2^32-ms boundary must
+    // NOT look fresh when the 64-bit reader clock is a full ms-cycle later.
+    sample_health_t a = {0};
+    uint64_t near_wrap_us = ((uint64_t)0xFFFFF000u) * 1000ull;        // old stamp
+    sample_mark_good(&a, near_wrap_us);
+    uint64_t full_cycle_later = near_wrap_us + ((uint64_t)1u << 32) * 1000ull;
+    CHECK(!sample_is_fresh(&a, full_cycle_later, W), "no revival after full 32-bit cycle (N10)");
 
     // fail does not refresh timing (retain last good, drop freshness over time)
     sample_mark_fail(&h, -5);
@@ -109,6 +121,16 @@ static void test_ota_identity(void) {
     mk_report(&rep, "75", shaA, IMG_VALID, 2, true);
     CHECK(ota_identity_accept(&tgt, &rep, 1, false) == OTA_ACCEPT, "exact+valid+reboot=ACCEPT");
 
+    // N09: require_sha=true but the report OMITS its digest (matches version,
+    // rebooted, VALID). Must FAIL CLOSED (WAIT), not fall back to version match.
+    mk_target(&tgt, "75", shaA, true);               // require sha
+    mk_report(&rep, "75", NULL, IMG_VALID, 2, true);  // report has no app_sha
+    CHECK(ota_identity_accept(&tgt, &rep, 1, false) == OTA_WAIT, "require_sha + missing report digest=WAIT (N09)");
+    // require_sha but TARGET digest empty -> also fail closed
+    mk_target(&tgt, "75", NULL, true);
+    mk_report(&rep, "75", shaA, IMG_VALID, 2, true);
+    CHECK(ota_identity_accept(&tgt, &rep, 1, false) == OTA_WAIT, "require_sha + missing target digest=WAIT (N09)");
+
     // same-version FAILURE: version matches but it ROLLED BACK (different sha)
     // and boot_id unchanged (no real reboot) -> WAIT then identity reject
     mk_target(&tgt, "75", shaB, true);               // wanted B
@@ -167,12 +189,55 @@ static void test_audio_cmd(void) {
     CHECK(audio_cmd_accept(&s, AUDIO_CMD_TONE), "retry permitted after fail");
 }
 
+// ---------- comfort rules (A05) ----------
+static void test_comfort_rules(void) {
+    printf("comfort_rules:\n");
+    // "High humidity >= 70%, clear at 65%, sustained for 10 s"
+    const comfort_rule_t r = { "High humidity", COMFORT_ABOVE, 70.0f, 65.0f, 10000 };
+    comfort_rt_t rt; comfort_rt_init(&rt);
+
+    // Below threshold -> idle
+    CHECK(comfort_rule_update(&r, &rt, true, 50.0f, 1000) == COMFORT_IDLE, "below=IDLE");
+    // Breach -> pending (not active yet)
+    CHECK(comfort_rule_update(&r, &rt, true, 72.0f, 2000) == COMFORT_PENDING, "breach=PENDING");
+    // Still pending before min_duration
+    CHECK(comfort_rule_update(&r, &rt, true, 73.0f, 9000) == COMFORT_PENDING, "pending<10s");
+    // Persisted >= 10 s -> active
+    CHECK(comfort_rule_update(&r, &rt, true, 73.0f, 12000) == COMFORT_ACTIVE, "sustained=ACTIVE");
+    // Hysteresis: 68% (between clear 65 and threshold 70) must NOT clear -> stays active
+    CHECK(comfort_rule_update(&r, &rt, true, 68.0f, 13000) == COMFORT_ACTIVE, "hysteresis holds ACTIVE");
+    // Cross clear point -> idle
+    CHECK(comfort_rule_update(&r, &rt, true, 64.0f, 14000) == COMFORT_IDLE, "cross clear=IDLE");
+
+    // No chatter: a breach that ends before maturing goes back to idle.
+    comfort_rt_init(&rt);
+    comfort_rule_update(&r, &rt, true, 72.0f, 1000);                 // PENDING
+    CHECK(comfort_rule_update(&r, &rt, true, 60.0f, 3000) == COMFORT_IDLE, "breach ended early=IDLE (no chatter)");
+
+    // Stale-suspend: a PENDING breach CANNOT mature across a data gap.
+    comfort_rt_init(&rt);
+    comfort_rule_update(&r, &rt, true, 72.0f, 1000);                 // PENDING @1s
+    comfort_rule_update(&r, &rt, false, 0.0f, 5000);                 // STALE @5s -> resets PENDING
+    CHECK(rt.state == COMFORT_IDLE, "stale resets PENDING (no silent maturation)");
+    // Even if a late valid breach arrives past the original min_duration, the
+    // clock restarts from the NEW breach — stale data can't back-date it.
+    CHECK(comfort_rule_update(&r, &rt, true, 72.0f, 12000) == COMFORT_PENDING, "re-breach restarts PENDING");
+    CHECK(comfort_rule_update(&r, &rt, true, 72.0f, 21500) == COMFORT_PENDING, "still pending 9.5s after re-breach");
+
+    // ms-wrap: breach starting just below 2^32 matures correctly after wrap.
+    comfort_rt_init(&rt);
+    comfort_rule_update(&r, &rt, true, 72.0f, 0xFFFFF000u);          // PENDING near wrap
+    // 0xFFFFF000 + 11000ms wraps to 0x00001AF8; elapsed = 11000 >= 10000 -> ACTIVE
+    CHECK(comfort_rule_update(&r, &rt, true, 72.0f, 0x00001AF8u) == COMFORT_ACTIVE, "matures across ms-wrap");
+}
+
 int main(void) {
     printf("=== echo core/ host tests ===\n");
     test_sample_model();
     test_readiness();
     test_ota_identity();
     test_audio_cmd();
+    test_comfort_rules();
     printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

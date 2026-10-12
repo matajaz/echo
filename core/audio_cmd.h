@@ -22,6 +22,8 @@ typedef enum {
     AUDIO_CMD_STOP,
     AUDIO_CMD_SET_VOLUME,
     AUDIO_CMD_MUTE,     // set muted true/false (arg != 0 => muted)
+    AUDIO_CMD_WAV,
+    AUDIO_CMD_VOLUME_ABSOLUTE,
 } audio_cmd_type_t;
 
 typedef struct {
@@ -29,6 +31,7 @@ typedef struct {
     int32_t          arg;   // song index / tone freq / volume / mute flag
     int32_t          arg2;  // tone duration (ms) when type==TONE
     uint32_t         id;    // monotonic accepted-command id
+    char            filename[48]; // owned by command, never a shared mailbox
 } audio_cmd_t;
 
 typedef enum {
@@ -49,12 +52,14 @@ typedef struct {
     int32_t  last_error;     // 0 = none; set on open/write failure
     uint32_t last_cmd_id;    // id of the last accepted command
     uint32_t stop_seq;       // bumped each time a stop completes (completion signal)
+    bool ready;
 } audio_status_t;
 
 static inline void audio_status_init(audio_status_t *s, int32_t vol) {
     if (!s) return;
     s->state = AUDIO_IDLE; s->playing_index = -1; s->volume = vol;
     s->muted = false; s->last_error = 0; s->last_cmd_id = 0; s->stop_seq = 0;
+    s->ready = false;
 }
 
 // Decide whether a NEW incoming command should be accepted given current state.
@@ -66,19 +71,20 @@ static inline bool audio_cmd_accept(const audio_status_t *s, audio_cmd_type_t t)
     switch (t) {
         case AUDIO_CMD_STOP:
         case AUDIO_CMD_SET_VOLUME:
+        case AUDIO_CMD_VOLUME_ABSOLUTE:
         case AUDIO_CMD_MUTE:
             return true;              // control commands always accepted
         case AUDIO_CMD_TONE:
         case AUDIO_CMD_SONG:
+        case AUDIO_CMD_WAV:
             return true;              // latest-play: replaces any current session
         default:
             return false;
     }
 }
 
-// Apply a lifecycle transition. Called by the owner as it drives the codec.
-// `index` is the song index (ignored for tone). These are the ONLY writers of
-// the status, so no locking is needed in the single-owner design.
+// Pure transitions; the firmware wraps them in its status lock so readers
+// always observe a whole lifecycle update. `index` is ignored for tones/WAV.
 static inline void audio_on_start(audio_status_t *s, bool is_song, int32_t index) {
     if (!s) return;
     s->state = AUDIO_STARTING;

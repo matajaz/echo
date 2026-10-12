@@ -7,8 +7,8 @@
 # entity_ids in the HA object-id form `domain.object_id`.
 #
 # Limits enforced by the generator (match ha_client.h):
-#   temperature: max 8 entries   battery: max 8 entries
-#   entity_id <= 63 chars        name <= 23 chars
+#   temperature: max 9 entries   battery: max 8 entries
+#   entity_id <= 79 chars        name <= 23 chars
 #
 # NOTE: tokens/credentials live ONLY in secrets/secrets.h, never here.
 
@@ -17,6 +17,7 @@ version: 1
 temperature:
   - id: sensor.ute_aquara_temperatur
     name: Ute-Aquara
+    role: outdoor
   - id: sensor.ute_grund_temperatur
     name: Ute-Grund
   - id: sensor.ute_temp3_temperatur
@@ -25,6 +26,7 @@ temperature:
     name: Oliver
   - id: sensor.kok_sonoff_temperatur_2
     name: Kok
+    role: indoor
   - id: sensor.badrum_temperatur
     name: Badrum
   - id: sensor.vind_temperatur
@@ -53,14 +55,25 @@ battery:
     name: Dusch
 
 # Power/energy tiles for the K01 Overview (A16). Values are W (live) or kWh
-# (energy today); the UI formats by index. entity_id form is the same.
+# (energy today); the UI binds by stable role. entity_id form is the same.
 power:
   - id: sensor.solar_power
-    name: Sol
+    name: Solar
+    role: solar_power
     unit: W
   - id: sensor.tibber_pulse_blomsterkungsvagen_416_power
-    name: Hus
+    name: Grid
+    role: grid_power
     unit: W
-  - id: sensor.sol_produktion_dag
-    name: Sol idag
+  - id: sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_production
+    name: Exported
+    role: grid_export_today
     unit: kWh
+  - id: sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_consumption
+    name: Imported
+    role: grid_import_today
+    unit: kWh
+  - id: sensor.nordpool_kwh_se3_sek_3_10_025
+    name: Price
+    role: price
+    unit: SEK/kWh

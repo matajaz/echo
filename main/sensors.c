@@ -14,8 +14,14 @@
 #include "qmi8658.h"
 #include "shtc3.h"
 #include "custom_io_expander_ch32v003.h"
+#include "time_utils.h"
+#include <time.h>
+#include <sys/time.h>
+#include <math.h>
 
 static const char *TAG = "sensors";
+_Static_assert(CONFIG_ECHO_BATTERY_ADC_FULL > CONFIG_ECHO_BATTERY_ADC_EMPTY,
+               "Battery full ADC must exceed empty ADC");
 
 static qmi8658_dev_t s_imu;
 static pcf85063a_dev_t s_rtc;
@@ -24,10 +30,37 @@ static i2c_master_dev_handle_t s_shtc3 = NULL;
 static sensors_data_t s_data;
 static SemaphoreHandle_t s_mtx = NULL;
 static bool s_started = false;
-static volatile bool s_paused = false;
+static bool s_paused;
+static bool s_ntp_synced;
+static bool s_rtc_seeded;
+static uint64_t s_rtc_written;
+void sensors_clock_synced(void) { __atomic_store_n(&s_ntp_synced,true,__ATOMIC_RELEASE); }
+const char *sensors_clock_source(void) {
+    return __atomic_load_n(&s_ntp_synced,__ATOMIC_ACQUIRE)?"NTP":
+        __atomic_load_n(&s_rtc_seeded,__ATOMIC_ACQUIRE)?"RTC":"Waiting for time";
+}
+static void rtc_sync(uint64_t now) {
+    if (!s_rtc.dev_handle || !__atomic_load_n(&s_ntp_synced,__ATOMIC_ACQUIRE) ||
+        (s_rtc_written && now-s_rtc_written<3600000000ULL)) return;
+    time_t t=time(NULL); struct tm utc; gmtime_r(&t,&utc);
+    if (!calendar_valid(utc.tm_year+1900,utc.tm_mon+1,utc.tm_mday,utc.tm_hour,utc.tm_min,utc.tm_sec)) return;
+    pcf85063a_datetime_t dt={.year=utc.tm_year+1900,.month=utc.tm_mon+1,.day=utc.tm_mday,
+        .dotw=utc.tm_wday,.hour=utc.tm_hour,.min=utc.tm_min,.sec=utc.tm_sec};
+    // set_time_date writes the seconds byte with bit 7 clear (OS reset).
+    if (pcf85063a_set_time_date(&s_rtc,dt)==ESP_OK) { s_rtc_written=now; ESP_LOGI(TAG,"RTC synchronized from NTP (UTC)"); }
+}
+static void rtc_seed(void) {
+    if (time(NULL)>1609459200 || !s_rtc.dev_handle) return;
+    uint8_t seconds=0; pcf85063a_datetime_t dt;
+    if (pcf85063a_read_register(&s_rtc,0x04,&seconds,1)!=ESP_OK || (seconds&0x80) ||
+        pcf85063a_get_time_date(&s_rtc,&dt)!=ESP_OK || dt.year<2021 ||
+        !calendar_valid(dt.year,dt.month,dt.day,dt.hour,dt.min,dt.sec)) return;
+    struct timeval wall={.tv_sec=calendar_epoch(dt.year,dt.month,dt.day,dt.hour,dt.min,dt.sec)};
+    if (settimeofday(&wall,NULL)==0) __atomic_store_n(&s_rtc_seeded,true,__ATOMIC_RELEASE);
+}
 
 void sensors_set_paused(bool paused) {
-    s_paused = paused;
+    __atomic_store_n(&s_paused,paused,__ATOMIC_RELEASE);
 }
 
 // --- SHTC3 CRC-validated read (#5b, 2026-10-10) ---------------------------
@@ -69,7 +102,7 @@ static esp_err_t shtc3_read_th_crc(i2c_master_dev_handle_t dev, float *t, float 
     // the sensor's clock stretch.
     esp_err_t ret = i2c_master_transmit(dev, meas, 2, 200);
     if (ret == ESP_OK) {
-        esp_rom_delay_us(13000);        // >12.1ms max conversion (T first, normal)
+        vTaskDelay(pdMS_TO_TICKS(13) + 1);        // >12.1ms max conversion (T first, normal)
         ret = i2c_master_receive(dev, rx, 6, 200);
     }
     (void)i2c_master_transmit(dev, sleep, 2, 100);
@@ -135,10 +168,12 @@ static bool imu_bring_up(i2c_master_bus_handle_t bus) {
 
 static void poll_task(void *arg) {
     (void)arg;
+    uint64_t slow_last=0;
+    bool motion_seeded=false; float last_ax=0,last_ay=0,last_az=0;
     while (1) {
         // While paused (audio playing), do no I2C work -- keeps the single
         // core free for the audio task so I2S DMA never starves.
-        if (s_paused) {
+        if (__atomic_load_n(&s_paused,__ATOMIC_ACQUIRE)) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -147,8 +182,10 @@ static void poll_task(void *arg) {
         d = s_data; // start from last (keeps *_ok flags for failed sensors)
         xSemaphoreGive(s_mtx);
 
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000); // ms since boot
+        uint64_t now = (uint64_t)esp_timer_get_time(); // us since boot (N10: 64-bit)
 
+        bool slow=!slow_last || now-slow_last>=5000000;
+        rtc_sync(now);
         if (d.imu_ok) {
             // Read into scratch and copy into d ONLY on success: on an I2C
             // NACK the driver may leave the out params untouched or garbage,
@@ -160,7 +197,12 @@ static void poll_task(void *arg) {
                 d.accel_x = ax;
                 d.accel_y = ay;
                 d.accel_z = az;
-                accel_ok = true;
+                accel_ok = true; d.accel_last_us=now;
+                if (motion_seeded && now-d.motion_last_us>3000000) {
+                    float dx=ax-last_ax,dy=ay-last_ay,dz=az-last_az;
+                    if (dx*dx+dy*dy+dz*dz>6.25f) { ++d.motion_seq; d.motion_last_us=now; }
+                }
+                last_ax=ax; last_ay=ay; last_az=az; motion_seeded=true;
             }
             if (qmi8658_read_gyro(&s_imu, &gx, &gy, &gz) == ESP_OK) {
                 d.gyro_x = gx;
@@ -175,21 +217,21 @@ static void poll_task(void *arg) {
             // renders together. Refresh it only when BOTH motion reads
             // succeeded this cycle — a die-temperature-only success must not
             // make stale accel/gyro appear fresh (previously any-success did).
-            if (accel_ok && gyro_ok) d.imu_last_ms = now;
+            if (accel_ok && gyro_ok) d.imu_last_us = now;
         }
-        if (d.th_ok) {
+        if (slow && d.th_ok) {
             float t = 0, h = 0;
             esp_err_t thr = shtc3_read_th_crc(s_shtc3, &t, &h);
             if (thr == ESP_OK) {
                 d.temp_c = t;
                 d.humidity_rh = h;
-                d.th_last_ms = now;        // R10: fresh + CRC-valid
+                d.th_last_us = now;        // R10: fresh + CRC-valid
             } else if (thr == ESP_ERR_INVALID_CRC) {
                 ESP_LOGW(TAG, "SHTC3 CRC mismatch — reading discarded");
                 // leave th_last_ms unchanged -> reads STALE via R10
             }
         }
-        if (d.rtc_ok) {
+        if (slow && d.rtc_ok) {
             pcf85063a_datetime_t dt;
             if (pcf85063a_get_time_date(&s_rtc, &dt) == ESP_OK) {
                 // #5 (2026-10-10): check the oscillator-stop / clock-integrity
@@ -212,7 +254,7 @@ static void poll_task(void *arg) {
                     d.hour = dt.hour;
                     d.min = dt.min;
                     d.sec = dt.sec;
-                    d.rtc_last_ms = now;       // R10: fresh + trustworthy
+                    d.rtc_last_us = now;       // R10: fresh + trustworthy
                 } else {
                     ESP_LOGW(TAG, "RTC oscillator-stop set (OS=1) — time untrusted");
                     // leave rtc_last_ms unchanged -> reads STALE via R10
@@ -228,7 +270,7 @@ static void poll_task(void *arg) {
         // a flat Li-ion curve clamp). TODO: calibrate adc_full/adc_empty
         // against a multimeter reading of the real pack. The RAW adc is
         // always honest even if the % needs trimming.
-        {
+        if (slow) {
             esp_io_expander_handle_t exp = display_get_io_expander();
             uint16_t adc = 0;
             if (exp != NULL && custom_io_expander_get_adc(exp, &adc) == ESP_OK) {
@@ -240,32 +282,33 @@ static void poll_task(void *arg) {
                 // ADC counts/volt, so empty(3.0V)~294. These bounds give a
                 // plausible SOC; refine against a multimeter if exactness
                 // is needed (the vendor doesn't publish the divider ratio).
-                const int adc_empty = 300; // ~3.0V
-                const int adc_full = 410;  // ~4.2V
-                int pct = (int)(((long)(adc - adc_empty) * 100) / (adc_full - adc_empty));
+                const int adc_empty = CONFIG_ECHO_BATTERY_ADC_EMPTY; // ~3.0V
+                const int adc_full = CONFIG_ECHO_BATTERY_ADC_FULL;  // ~4.2V
+                int pct = (int)(((long)(adc - adc_empty) * 100) / (adc_full > adc_empty ? adc_full - adc_empty : 1));
                 if (pct < 0) pct = 0;
                 if (pct > 100) pct = 100;
                 d.bat_soc_pct = pct;
                 d.bat_ok = true;
-                d.bat_last_ms = now;       // R10
+                d.bat_last_us = now;       // R10
             }
         }
 
-        d.now_ms = now;  // R10: publish-time clock for age computation
+        d.now_us = now;  // R10: publish-time clock for age computation
 
         xSemaphoreTake(s_mtx, portMAX_DELAY);
         s_data = d;
         xSemaphoreGive(s_mtx);
 
         // Log a compact line so the readings are verifiable via /log.
-        ESP_LOGI(TAG,
+        if (slow) ESP_LOGI(TAG,
                  "imu[%d] a=%.2f,%.2f,%.2f g=%.1f,%.1f,%.1f t=%.1fC | th[%d] %.1fC %.0f%%RH | rtc[%d] %04u-%02u-%02u %02u:%02u:%02u | bat[%d] adc=%u soc=%d%%",
                  d.imu_ok, d.accel_x, d.accel_y, d.accel_z, d.gyro_x, d.gyro_y,
                  d.gyro_z, d.imu_temp_c, d.th_ok, d.temp_c, d.humidity_rh,
                  d.rtc_ok, d.year, d.month, d.day, d.hour, d.min, d.sec,
                  d.bat_ok, d.bat_adc, d.bat_soc_pct);
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (slow) slow_last=now;
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -325,6 +368,7 @@ esp_err_t sensors_init(void) {
         ESP_LOGW(TAG, "PCF85063A RTC init failed");
     }
 
+    rtc_seed();
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     s_data = d;
     xSemaphoreGive(s_mtx);

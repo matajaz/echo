@@ -1,512 +1,228 @@
-// echo -- Home Assistant REST client for temperature sensors.
-// See ha_client.h for the contract.
-
 #include "ha_client.h"
-
+#include "ha_entities.generated.h"
+#include "ha_parse.h"
+#include "ha_energy.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-
-#include <math.h>
-#include <inttypes.h>
-#include <stdio.h>
+#include "secrets.h"
+#include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <time.h>
 
-#include "secrets.h"
-
-static const char *TAG = "ha_client";
-
-// Poll cadence. HA states change slowly (a room temperature), so 30 s is
-// plenty and keeps the shared single-core chip free for audio/sensors.
-#define HA_POLL_PERIOD_MS 30000
-// Per-request timeout. Short: a stuck request must not hold the poll task
-// (and its snapshot write) for long. Matches the lightweight poll spirit of
-// the sibling Vegena client (700 ms there); this box is a full ESP32 so a
-// slightly larger budget is fine.
-#define HA_HTTP_TIMEOUT_MS 3000
-// Cap the response body we buffer. /api/states/<entity> for a single
-// entity is well under 2 KB; a 4 KB cap bounds heap use even if HA (or a
-// wrong URL) returns a big document.
-#define HA_MAX_BODY 4096
-
-// Configured entities. EDIT THIS LIST (or generate it from a build macro)
-// to match your HA instance. entity_id is the HA object id; name is the
-// short label shown on the panel. The LIST ITSELF now lives in
-// catalogue/entities.yaml and is generated into ha_entities.generated.h by
-// tools/gen_entities.py (A15) — edit the catalogue + regenerate, don't hand-edit
-// the arrays. The generated type is ha_entity_def_t; we alias it so the rest of
-// this file (which refers to ha_entity_cfg_t) is unchanged.
-//
-// NOTE preserved from the hand-written list: k_entities has 8 rows but
-// k_batt_entities has 7 — the V-rum temperature sensor exposes NO battery
-// entity in HA, so there is nothing to show for it. Do not invent an id — a
-// 404 poisons last_http_code for the whole cycle. (Keep the catalogue in sync.)
-#include "ha_entities.generated.h"
-typedef ha_entity_def_t ha_entity_cfg_t;
-#define HA_CFG_COUNT ((int)(sizeof(k_entities) / sizeof(k_entities[0])))
-#define HA_BATT_CFG_COUNT ((int)(sizeof(k_batt_entities) / sizeof(k_batt_entities[0])))
-#define HA_POWER_CFG_COUNT ((int)(sizeof(k_power_entities) / sizeof(k_power_entities[0])))
-
+#define HA_MAX_BODY 32768
+#define COUNT(a) ((int)(sizeof(a)/sizeof((a)[0])))
+static const char *TAG="ha_client";
 static ha_data_t s_data;
-static SemaphoreHandle_t s_mtx = NULL;
-static bool s_started = false;
-
-// OTA polling-quiescence handshake (V10, generation-tagged 2026-10-10).
-// s_pause_req: OTA asks the poll task to park (sole writer: pause/resume).
-// s_pause_gen: bumped on EVERY pause request. s_ack_gen: the poll task sets it
-// to the generation it has actually parked for (sole writer: poll task).
-// A waiter accepts the ack only when s_ack_gen == its OWN requested generation,
-// so a STALE idle left over from a prior pause (resumed, task not yet un-idled)
-// cannot acknowledge a brand-new pause — the check-then-act race the plain
-// s_poll_idle boolean had. The poll task also RECHECKS s_pause_req immediately
-// before poll_once(), so no HTTP can start after an ack for the current gen.
-static volatile bool s_pause_req = false;
-static volatile uint32_t s_pause_gen = 0;
-static volatile uint32_t s_ack_gen = 0;
-
-// Buffer passed to the HTTP event handler via user_data. Bounded by
-// HA_MAX_BODY; overrun is flagged so the fetch is treated as failed rather
-// than silently truncated into invalid JSON.
-typedef struct {
-    char  buf[HA_MAX_BODY];
-    size_t len;
-    bool  overflow;
-} ha_http_buf_t;
-
-static esp_err_t http_event_cb(esp_http_client_event_t *evt) {
-    ha_http_buf_t *b = (ha_http_buf_t *)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && b != NULL) {
-        if (b->len + evt->data_len >= sizeof(b->buf)) {
-            b->overflow = true; // keep draining; just refuse to store more
-            return ESP_OK;
-        }
-        memcpy(b->buf + b->len, evt->data, evt->data_len);
-        b->len += evt->data_len;
-        b->buf[b->len] = '\0';
+static energy_prices_t *s_prices, *s_price_stage;
+static energy_history_t s_history;
+static SemaphoreHandle_t s_mtx;
+static bool s_started;
+static bool s_pause_req;
+static uint32_t s_pause_gen, s_ack_gen;
+static int s_day_offset;
+static uint32_t s_history_request;
+static char *s_body;
+typedef struct { char *buf; size_t len; bool overflow; } http_body_t;
+static void *json_alloc(size_t n) { return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT); }
+static bool paused(void) { return __atomic_load_n(&s_pause_req,__ATOMIC_ACQUIRE); }
+static esp_err_t http_event(esp_http_client_event_t *e) {
+    http_body_t *b=e->user_data;
+    if (e->event_id == HTTP_EVENT_ON_DATA && b && e->data_len > 0) {
+        if (b->overflow || (size_t)e->data_len >= HA_MAX_BODY-b->len) b->overflow=true;
+        else { memcpy(b->buf+b->len,e->data,e->data_len); b->len+=e->data_len; b->buf[b->len]=0; }
     }
     return ESP_OK;
 }
-
-// Parse a HA state string to a Celsius float. "unavailable"/"unknown"/
-// ""/non-numeric -> NAN (never 0, so a missing sensor can't masquerade as
-// a real 0 C reading). Mirrors the sibling Vegena/Vegena as_float() helper.
-static float parse_state_temp(const char *s) {
-    if (s == NULL) return NAN;
-    while (*s == ' ' || *s == '\t') s++; // tolerate leading whitespace
-    if (*s == '\0' || strcmp(s, "unavailable") == 0 || strcmp(s, "unknown") == 0 ||
-        strcmp(s, "None") == 0 || strcmp(s, "null") == 0 || strcmp(s, "nan") == 0) {
-        return NAN;
+static void init_entries(ha_sensor_t *dest,const ha_entity_def_t *defs,int count,uint32_t stale) {
+    for (int i=0;i<count;++i) {
+        strlcpy(dest[i].entity_id,defs[i].entity_id,sizeof(dest[i].entity_id));
+        strlcpy(dest[i].name,defs[i].name,sizeof(dest[i].name));
+        strlcpy(dest[i].unit,defs[i].unit,sizeof(dest[i].unit));
+        dest[i].role=defs[i].role; dest[i].value=NAN; dest[i].stale_ms=stale;
+        dest[i].result=HA_LOADING;
     }
-    char *end = NULL;
-    float v = strtof(s, &end);
-    if (end == s || *end != '\0') return NAN; // not fully numeric
-    if (!isfinite(v)) return NAN;
-    return v;
 }
-
-// Minimal, allocation-free "state" extractor for a HA state object. We only
-// need the top-level "state" string. A full JSON parser is unnecessary for
-// one field and would pull in a dependency; instead find the FIRST
-// "state"\s*:\s*"..." occurrence. HA's object key order puts "entity_id",
-// "state", "attributes"... but not guaranteed -- we scan for the key and
-// handle simple escapes. Returns true and fills out[..] on success.
-//
-// DEPTH-AWARE (#2, 2026-10-10): a plain strstr("\"state\"") matches the FIRST
-// "state" at ANY nesting depth, so an attribute literally named "state" inside
-// the attributes{} object could be returned instead of the top-level entity
-// state. This scans only brace-DEPTH-1 keys (the object's own fields), skipping
-// over nested objects/arrays and string contents, so it returns the real
-// top-level "state" value regardless of key order or nested look-alikes.
-static bool extract_state(const char *json, char *out, size_t outsz) {
-    if (json == NULL || out == NULL || outsz == 0) return false;
-    const char *p = json;
-    int depth = 0;
-    while (*p) {
-        char c = *p;
-        if (c == '"') {
-            // Start of a string token. Capture it (unescaped) to check if it's
-            // a key, then decide based on depth + the following ':'.
-            const char *start = p + 1;
-            const char *q = start;
-            while (*q && *q != '"') { if (*q == '\\' && q[1]) q++; q++; }
-            // V04: if the scan stopped on NUL (not a closing quote) the body is
-            // truncated/incomplete mid-token. Reject rather than dereference q+1
-            // past the buffer end. A valid key always ends on a real '"'.
-            if (*q != '"') return false;
-            // Is this the top-level "state" KEY (depth 1, followed by ':')?
-            if (depth == 1 && (size_t)(q - start) == 5 && strncmp(start, "state", 5) == 0) {
-                const char *r = q + 1;
-                while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
-                if (*r == ':') {
-                    r++;
-                    while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
-                    if (*r != '"') return false;   // state must be a string value
-                    r++;
-                    size_t n = 0;
-                    while (*r && *r != '"' && n + 1 < outsz) {
-                        if (*r == '\\' && r[1]) r++;
-                        out[n++] = *r++;
-                    }
-                    out[n] = '\0';
-                    return (*r == '"');
-                }
-            }
-            p = (*q == '"') ? q + 1 : q;   // skip past the string token
-            continue;
-        }
-        if (c == '{' || c == '[') depth++;
-        else if (c == '}' || c == ']') depth--;
-        p++;
-    }
-    return false;  // no top-level "state" found
+static unsigned cadence(const ha_sensor_t *s,int group) {
+    if (s->role==HA_ROLE_PRICE) return 300000;
+    return group==0 ? 10000 : group==1 ? 30000 : 300000;
 }
-
-// Fetch one entity's state into hb using a SHARED, kept-alive client.
-// Reusing one connection across all entities (same host:port) avoids opening
-// a fresh TCP socket per entity. This cuts per-poll connection churn (N GETs
-// over 1 connection instead of N), which is a good idea regardless of root
-// cause. (It was previously described as THE fix for a proven TIME_WAIT
-// socket exhaustion; that cause is unverified — see sdkconfig.defaults — but
-// the reuse is still worth keeping.) Returns HTTP status, or <0 on a
-// transport error.
-static int fetch_entity(esp_http_client_handle_t client, const char *entity_id,
-                        ha_http_buf_t *hb) {
-    char url[192];
-    // Defensive: reject an entity id that could break the URL (a stray
-    // quote/space). These are compile-time constants, but the guard keeps a
-    // future config source honest and the URL well-formed.
-    for (const char *q = entity_id; *q; q++) {
-        if (*q == '"' || *q == ' ' || *q == '\r' || *q == '\n') {
-            ESP_LOGW(TAG, "refusing malformed entity id: %s", entity_id);
-            return -1;
-        }
+static void fetch(esp_http_client_handle_t client,http_body_t *b,ha_sensor_t *entry) {
+    char url[256];
+    int n=snprintf(url,sizeof(url),"%s/api/states/%s",HA_BASE_URL,entry->entity_id);
+    if (n<0 || (size_t)n>=sizeof(url)) return;
+    b->len=0; b->overflow=false; b->buf[0]=0;
+    esp_err_t err=esp_http_client_set_url(client,url);
+    if (err==ESP_OK) err=esp_http_client_perform(client);
+    int code=err==ESP_OK ? esp_http_client_get_status_code(client) : -1;
+    float value=NAN;
+    bool price=entry->role==HA_ROLE_PRICE;
+    ha_result_t result=err!=ESP_OK ? HA_OFFLINE : code!=200 ? HA_HTTP_ERROR :
+        b->overflow ? HA_OVERFLOW : ha_parse_state(b->buf,entry->unit,&value,price?s_price_stage:NULL);
+    uint64_t now=esp_timer_get_time();
+    xSemaphoreTake(s_mtx,portMAX_DELAY);
+    entry->checked_us=now; entry->http_code=code; entry->result=result;
+    s_data.last_http_code=code;
+    if (code==200) s_data.last_response_us=now;
+    if (result==HA_VALID) {
+        entry->value=value; entry->ok=true; entry->received_us=now;
+        if (price) { s_price_stage->received_us=now; *s_prices=*s_price_stage; }
     }
-    int url_n = snprintf(url, sizeof(url), "%s/api/states/%s", HA_BASE_URL, entity_id);
-    if (url_n < 0 || (size_t)url_n >= sizeof(url)) {
-        return -1; // truncated URL -> don't fetch
-    }
-
-    if (client == NULL || hb == NULL) return -1;
-    hb->len = 0;
-    hb->overflow = false;
-    hb->buf[0] = '\0';   // #2: clear so an empty response can't reuse the
-                         // previous entity's body as this entity's state.
-
-    // Point the kept-alive client at this entity's URL. user_data was bound
-    // to hb at init time; it stays valid across requests (same hb).
-    if (esp_http_client_set_url(client, url) != ESP_OK) return -1;
-
-    esp_err_t err = esp_http_client_perform(client);
-    int code = -1;
-    if (err == ESP_OK) {
-        code = esp_http_client_get_status_code(client);
-    } else {
-        ESP_LOGW(TAG, "GET %s failed: %s", entity_id, esp_err_to_name(err));
-    }
-    return code;
-}
-
-static void poll_once(void) {
-    // Only poll when the link is up; otherwise leave last values (ok flags
-    // are cleared below so stale readings don't look live).
-    wifi_ap_record_t ap;
-    bool wifi_up = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
-
-    ha_data_t d = {0};
-    d.started = true;
-    d.count = HA_CFG_COUNT;
-    d.wifi_up = wifi_up;
-    for (int i = 0; i < HA_CFG_COUNT && i < HA_MAX_SENSORS; i++) {
-        ha_sensor_t *s = &d.sensors[i];
-        strncpy(s->entity_id, k_entities[i].entity_id, sizeof(s->entity_id) - 1);
-        strncpy(s->name, k_entities[i].name, sizeof(s->name) - 1);
-        s->temp_c = NAN;
-        s->ok = false;
-    }
-    d.batt_count = (HA_BATT_CFG_COUNT < HA_MAX_BATT) ? HA_BATT_CFG_COUNT : HA_MAX_BATT;
-    for (int i = 0; i < d.batt_count; i++) {
-        ha_sensor_t *s = &d.batteries[i];
-        strncpy(s->entity_id, k_batt_entities[i].entity_id, sizeof(s->entity_id) - 1);
-        strncpy(s->name, k_batt_entities[i].name, sizeof(s->name) - 1);
-        s->temp_c = NAN;
-        s->ok = false;
-    }
-    d.power_count = (HA_POWER_CFG_COUNT < HA_MAX_POWER) ? HA_POWER_CFG_COUNT : HA_MAX_POWER;
-    for (int i = 0; i < d.power_count; i++) {
-        ha_sensor_t *s = &d.power[i];
-        strncpy(s->entity_id, k_power_entities[i].entity_id, sizeof(s->entity_id) - 1);
-        strncpy(s->name, k_power_entities[i].name, sizeof(s->name) - 1);
-        strncpy(s->unit, k_power_entities[i].unit, sizeof(s->unit) - 1);
-        s->temp_c = NAN;
-        s->ok = false;
-    }
-
-    if (!wifi_up) {
-        xSemaphoreTake(s_mtx, portMAX_DELAY);
-        s_data = d; // count/meta populated, all ok=0
-        xSemaphoreGive(s_mtx);
-        return;
-    }
-
-    int last_code = 0;
-    static ha_http_buf_t hb; // file-static: only the single poll task uses it
-
-    // One kept-alive client for the whole cycle (all entities share host:port).
-    // keep_alive_enable keeps the TCP connection open between the per-entity
-    // GETs, so a poll of N entities uses ONE connection instead of N — fewer
-    // connects/closes per cycle (good hygiene; not a verified fix for any
-    // specific OTA failure — see sdkconfig.defaults).
-    const esp_http_client_config_t cfg = {
-        .url = HA_BASE_URL "/api/states/_init_", // replaced per-request via set_url
-        .timeout_ms = HA_HTTP_TIMEOUT_MS,
-        .event_handler = http_event_cb,
-        .user_data = &hb,
-        .disable_auto_redirect = true,
-        .keep_alive_enable = true,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (client != NULL) {
-        if (HA_TOKEN[0] != '\0') {
-            // HA long-lived tokens are JWTs ~180-250 chars. The old 160-byte
-            // buffer SILENTLY TRUNCATED them -> a malformed "Bearer <partial>"
-            // header -> HA rejects with the OAuth "resource_metadata" error
-            // (the live auth failure seen on-device, 2026-10-10). Size the
-            // header to the actual token length, and sanity-check it.
-            size_t tlen = strlen(HA_TOKEN);
-            if (tlen < 20) {
-                ESP_LOGW(TAG, "HA_TOKEN looks too short (%u chars) — auth will likely fail",
-                         (unsigned)tlen);
-            }
-            char auth[8 + 320 + 1];   // "Bearer " + up to 320 token chars + NUL
-            int w = snprintf(auth, sizeof(auth), "Bearer %s", HA_TOKEN);
-            if (w < 0 || (size_t)w >= sizeof(auth)) {
-                ESP_LOGE(TAG, "HA_TOKEN too long (%u chars) — Authorization header "
-                              "truncated; auth will fail", (unsigned)tlen);
-            }
-            esp_http_client_set_header(client, "Authorization", auth);
-        }
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-
-        for (int i = 0; i < HA_CFG_COUNT && i < HA_MAX_SENSORS; i++) {
-            ha_sensor_t *s = &d.sensors[i];
-            int code = fetch_entity(client, s->entity_id, &hb);
-            last_code = code;
-            if (code == 200 && !hb.overflow) {
-                char state[64];
-                if (extract_state(hb.buf, state, sizeof(state))) {
-                    float t = parse_state_temp(state);
-                    if (!isnan(t)) {
-                        s->temp_c = t;
-                        s->ok = true;
-                    }
-                }
-            } else if (hb.overflow) {
-                ESP_LOGW(TAG, "%s: response exceeded %d bytes", s->entity_id, HA_MAX_BODY);
-            }
-        }
-
-        // Battery entities: same sensors, separate HA objects (device_class=
-        // battery). parse_state_temp is reused as a generic numeric-state
-        // extractor (NAN for "unavailable"/"unknown"); the value is a percent,
-        // stored in temp_c. Same kept-alive client, so still one connection.
-        for (int i = 0; i < d.batt_count; i++) {
-            ha_sensor_t *s = &d.batteries[i];
-            int code = fetch_entity(client, s->entity_id, &hb);
-            last_code = code;
-            if (code == 200 && !hb.overflow) {
-                char state[64];
-                if (extract_state(hb.buf, state, sizeof(state))) {
-                    float v = parse_state_temp(state);
-                    if (!isnan(v)) {
-                        s->temp_c = v;
-                        s->ok = true;
-                    }
-                }
-            }
-        }
-
-        // Power/energy entities (device_class=power/energy) for the K01
-        // Overview. parse_state_temp is reused as the generic numeric
-        // extractor (NAN for unavailable/unknown); temp_c carries W (power)
-        // or kWh (energy) per the catalogue entry. Still the kept-alive
-        // client, so no extra connection.
-        for (int i = 0; i < d.power_count; i++) {
-            ha_sensor_t *s = &d.power[i];
-            int code = fetch_entity(client, s->entity_id, &hb);
-            last_code = code;
-            if (code == 200 && !hb.overflow) {
-                char state[64];
-                if (extract_state(hb.buf, state, sizeof(state))) {
-                    float v = parse_state_temp(state);
-                    if (!isnan(v)) {
-                        s->temp_c = v;
-                        s->ok = true;
-                    }
-                }
-            }
-        }
-        esp_http_client_cleanup(client); // one close per cycle, not per entity
-    } else {
-        ESP_LOGW(TAG, "HA poll: client init failed");
-        last_code = -1;
-    }
-    d.last_http_code = last_code;
-
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
-    s_data = d;
+    // Keep last-good data on failure, with explicit result/age for the UI.
     xSemaphoreGive(s_mtx);
-
-    ESP_LOGI(TAG, "HA poll: %d entities + %d batteries + %d power, last_code=%d, wifi=%d",
-             d.count, d.batt_count, d.power_count, last_code, wifi_up);
+    if (result!=HA_VALID) ESP_LOGW(TAG,"%s: %s (http=%d bytes=%u)",entry->entity_id,
+        ha_result_name(result),code,(unsigned)b->len);
 }
-
-static void ha_poll_task(void *arg) {
+static void poll_task(void *arg) {
     (void)arg;
+    http_body_t body={.buf=s_body};
+    uint64_t last_history=0; uint32_t request_seen=UINT32_MAX;
     for (;;) {
-        // Quiescence handshake: if OTA (or anyone) requested a pause, park HERE
-        // — BEFORE any HTTP in poll_once() — and publish the ACK generation so
-        // the requester knows no HA GET is in flight for THIS request.
-        if (__atomic_load_n(&s_pause_req, __ATOMIC_ACQUIRE)) {
-            // Ack the generation we are parking for; refresh it each loop so a
-            // pause re-requested while we are already parked is acked too.
-            while (__atomic_load_n(&s_pause_req, __ATOMIC_ACQUIRE)) {
-                __atomic_store_n(&s_ack_gen,
-                                 __atomic_load_n(&s_pause_gen, __ATOMIC_ACQUIRE),
-                                 __ATOMIC_RELEASE);
+        if (paused()) {
+            while (paused()) {
+                __atomic_store_n(&s_ack_gen,__atomic_load_n(&s_pause_gen,__ATOMIC_ACQUIRE),__ATOMIC_RELEASE);
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
         }
-        // V10: recheck immediately before HTTP. If a pause arrived in the window
-        // between the park-loop exit and here, loop back and park rather than
-        // starting a GET the requester thinks is quiesced.
-        if (__atomic_load_n(&s_pause_req, __ATOMIC_ACQUIRE)) continue;
-        poll_once();
-        // Break the inter-poll sleep into short slices so a pause request mid-
-        // sleep is honored promptly (not up to HA_POLL_PERIOD_MS later).
-        for (int slept = 0; slept < HA_POLL_PERIOD_MS; slept += 200) {
-            if (__atomic_load_n(&s_pause_req, __ATOMIC_ACQUIRE)) break;
-            vTaskDelay(pdMS_TO_TICKS(200));
+        wifi_ap_record_t ap;
+        bool wifi=esp_wifi_sta_get_ap_info(&ap)==ESP_OK;
+        xSemaphoreTake(s_mtx,portMAX_DELAY); s_data.wifi_up=wifi; xSemaphoreGive(s_mtx);
+        bool due=false; uint64_t tick_now=esp_timer_get_time();
+        for (int group=0;group<3;++group) {
+            const ha_sensor_t *entries=group==0?s_data.power:group==1?s_data.sensors:s_data.batteries;
+            int count=group==0?s_data.power_count:group==1?s_data.count:s_data.batt_count;
+            for (int i=0;i<count;++i) if (!entries[i].checked_us || tick_now-entries[i].checked_us >= (uint64_t)cadence(&entries[i],group)*1000) due=true;
         }
+        if (wifi && due && !paused()) {
+            esp_http_client_config_t cfg={.url=HA_BASE_URL,.timeout_ms=1500,.event_handler=http_event,
+                .user_data=&body,.disable_auto_redirect=true,.keep_alive_enable=true,
+                .crt_bundle_attach=esp_crt_bundle_attach};
+            esp_http_client_handle_t client=esp_http_client_init(&cfg);
+            if (client) {
+                char auth[sizeof(HA_TOKEN)+8];
+                snprintf(auth,sizeof(auth),"Bearer %s",HA_TOKEN);
+                esp_http_client_set_header(client,"Authorization",auth);
+                // Live power first; publish each entity immediately. Temperature
+                // and battery polling cannot delay visibility until a whole cycle ends.
+                for (int group=0;group<3 && !paused();++group) {
+                    ha_sensor_t *entries=group==0?s_data.power:group==1?s_data.sensors:s_data.batteries;
+                    int count=group==0?s_data.power_count:group==1?s_data.count:s_data.batt_count;
+                    for (int i=0;i<count && !paused();++i) {
+                        uint64_t now=esp_timer_get_time();
+                        if (!entries[i].checked_us || now-entries[i].checked_us >= (uint64_t)cadence(&entries[i],group)*1000)
+                            fetch(client,&body,&entries[i]);
+                    }
+                }
+                esp_http_client_cleanup(client);
+            }
+        }
+        uint64_t now=esp_timer_get_time();
+        uint32_t request=__atomic_load_n(&s_history_request,__ATOMIC_ACQUIRE);
+        if (!paused() && time(NULL)>1609459200 && (!last_history || request!=request_seen || now-last_history>=600000000ULL)) {
+            static energy_history_t history;
+            int day=__atomic_load_n(&s_day_offset,__ATOMIC_ACQUIRE);
+            ha_energy_fetch(day,&history,paused);
+            if (!paused()) {
+                xSemaphoreTake(s_mtx,portMAX_DELAY);
+                // Preserve cached data only for the requested calendar day.
+                if (history.ok || s_history.day_start!=history.day_start) s_history=history;
+                else strlcpy(s_history.error,history.error,sizeof(s_history.error));
+                xSemaphoreGive(s_mtx);
+                last_history=now; request_seen=request;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
-
-bool ha_poll_pause(unsigned timeout_ms) {
-    // If the poll task never started, there's nothing to quiesce.
-    if (!s_started) return true;
-    // V10: bump the generation and remember OURS. The ack must match THIS
-    // generation — a stale ack from a previous pause cannot satisfy us.
-    uint32_t my_gen = __atomic_add_fetch(&s_pause_gen, 1, __ATOMIC_ACQ_REL);
-    // The pause request is ALWAYS issued here. If the ack times out we return
-    // false but LEAVE s_pause_req set — so the caller MUST call ha_poll_resume()
-    // on every exit path regardless of this return value, or polling stays
-    // parked forever (R7). The bool only reports whether the poll task
-    // confirmed it parked for OUR generation within the timeout.
-    __atomic_store_n(&s_pause_req, true, __ATOMIC_RELEASE);
-    unsigned waited = 0;
-    while (__atomic_load_n(&s_ack_gen, __ATOMIC_ACQUIRE) != my_gen) {
-        if (waited >= timeout_ms) {
-            ESP_LOGW(TAG, "ha_poll_pause: gen %" PRIu32 " not acked within %u ms "
-                          "(request stays set; caller must resume)", my_gen, timeout_ms);
-            return false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-        waited += 20;
-    }
-    ESP_LOGI(TAG, "HA polling paused (gen %" PRIu32 " acked in %u ms)", my_gen, waited);
-    return true;
-}
-
-void ha_poll_resume(void) {
-    __atomic_store_n(&s_pause_req, false, __ATOMIC_RELEASE);
-    ESP_LOGI(TAG, "HA polling resumed");
-}
-
 esp_err_t ha_init(void) {
-    if (s_started) {
-        return ESP_OK;
-    }
-    s_mtx = xSemaphoreCreateMutex();
-    if (s_mtx == NULL) {
-        ESP_LOGE(TAG, "mutex create failed");
+    if (__atomic_load_n(&s_started,__ATOMIC_ACQUIRE)) return ESP_OK;
+    s_mtx=xSemaphoreCreateMutex();
+    s_prices=json_alloc(sizeof(*s_prices)); s_price_stage=json_alloc(sizeof(*s_price_stage));
+    s_body=json_alloc(HA_MAX_BODY);
+    if (!s_mtx || !s_prices || !s_price_stage || !s_body) {
+        free(s_prices); free(s_price_stage); free(s_body);
+        if (s_mtx) vSemaphoreDelete(s_mtx);
+        s_mtx=NULL; s_prices=s_price_stage=NULL; s_body=NULL;
         return ESP_ERR_NO_MEM;
     }
-
-    // Publish the identity metadata immediately so the UI can render the
-    // list (with "--" values) before the first successful fetch.
-    ha_data_t d = {0};
-    d.started = true;
-    d.count = (HA_CFG_COUNT < HA_MAX_SENSORS) ? HA_CFG_COUNT : HA_MAX_SENSORS;
-    for (int i = 0; i < d.count; i++) {
-        strncpy(d.sensors[i].entity_id, k_entities[i].entity_id,
-                sizeof(d.sensors[i].entity_id) - 1);
-        strncpy(d.sensors[i].name, k_entities[i].name, sizeof(d.sensors[i].name) - 1);
-        d.sensors[i].temp_c = NAN;
-        d.sensors[i].ok = false;
+    memset(s_prices,0,sizeof(*s_prices));
+    cJSON_Hooks hooks={.malloc_fn=json_alloc,.free_fn=free}; cJSON_InitHooks(&hooks);
+    s_data.count=COUNT(k_entities); s_data.batt_count=COUNT(k_batt_entities); s_data.power_count=COUNT(k_power_entities);
+    init_entries(s_data.sensors,k_entities,s_data.count,90000);
+    init_entries(s_data.batteries,k_batt_entities,s_data.batt_count,900000);
+    init_entries(s_data.power,k_power_entities,s_data.power_count,45000);
+    for (int i=0;i<s_data.power_count;++i) if (s_data.power[i].role==HA_ROLE_PRICE) s_data.power[i].stale_ms=900000;
+    if (xTaskCreate(poll_task,"ha_poll",6144,NULL,3,NULL)!=pdPASS) {
+        free(s_prices); free(s_price_stage); free(s_body); vSemaphoreDelete(s_mtx);
+        s_mtx=NULL; s_prices=s_price_stage=NULL; s_body=NULL;
+        return ESP_ERR_NO_MEM;
     }
-    d.batt_count = (HA_BATT_CFG_COUNT < HA_MAX_BATT) ? HA_BATT_CFG_COUNT : HA_MAX_BATT;
-    for (int i = 0; i < d.batt_count; i++) {
-        strncpy(d.batteries[i].entity_id, k_batt_entities[i].entity_id,
-                sizeof(d.batteries[i].entity_id) - 1);
-        strncpy(d.batteries[i].name, k_batt_entities[i].name,
-                sizeof(d.batteries[i].name) - 1);
-        d.batteries[i].temp_c = NAN;
-        d.batteries[i].ok = false;
-    }
-    d.power_count = (HA_POWER_CFG_COUNT < HA_MAX_POWER) ? HA_POWER_CFG_COUNT : HA_MAX_POWER;
-    for (int i = 0; i < d.power_count; i++) {
-        strncpy(d.power[i].entity_id, k_power_entities[i].entity_id,
-                sizeof(d.power[i].entity_id) - 1);
-        strncpy(d.power[i].name, k_power_entities[i].name,
-                sizeof(d.power[i].name) - 1);
-        strncpy(d.power[i].unit, k_power_entities[i].unit,
-                sizeof(d.power[i].unit) - 1);
-        d.power[i].temp_c = NAN;
-        d.power[i].ok = false;
-    }
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
-    s_data = d;
-    xSemaphoreGive(s_mtx);
-
-    // #4 (2026-10-10): create the poll task BEFORE marking the module started.
-    // The old order set s_started=true first, so a task-create failure left
-    // ha_get() reporting "started" while the poll task never ran — stale/empty
-    // data that looks alive. Now s_started reflects worker LIVENESS, not just
-    // that init was attempted.
-    if (xTaskCreate(ha_poll_task, "ha_poll", 6144, NULL, 3, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to start HA poll task");
-        return ESP_ERR_NO_MEM;   // s_started stays false -> ha_get() returns false
-    }
-    s_started = true;
-    ESP_LOGI(TAG, "HA client started (%d entities)", d.count);
+    s_data.started=true; __atomic_store_n(&s_started,true,__ATOMIC_RELEASE);
     return ESP_OK;
 }
-
 bool ha_get(ha_data_t *out) {
-    if (!s_started || out == NULL) {
+    if (!out) return false;
+    if (!__atomic_load_n(&s_started,__ATOMIC_ACQUIRE)) {
+        // Metadata is compile-time data, so pages remain labelled even before
+        // the service starts or if its allocation fails. No global snapshot is
+        // read while startup is publishing it.
+        memset(out,0,sizeof(*out));
+        out->count=COUNT(k_entities); out->batt_count=COUNT(k_batt_entities); out->power_count=COUNT(k_power_entities);
+        init_entries(out->sensors,k_entities,out->count,90000);
+        init_entries(out->batteries,k_batt_entities,out->batt_count,900000);
+        init_entries(out->power,k_power_entities,out->power_count,45000);
         return false;
     }
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
-    *out = s_data;
-    xSemaphoreGive(s_mtx);
+    xSemaphoreTake(s_mtx,portMAX_DELAY); *out=s_data; xSemaphoreGive(s_mtx);
+    uint64_t now=esp_timer_get_time();
+    out->connected=out->wifi_up && out->last_response_us && now-out->last_response_us<=90000000;
     return true;
 }
-
-int ha_sensor_count(void) {
-    return (HA_CFG_COUNT < HA_MAX_SENSORS) ? HA_CFG_COUNT : HA_MAX_SENSORS;
+bool ha_prices_get(energy_prices_t *out) {
+    if (!out || !__atomic_load_n(&s_started,__ATOMIC_ACQUIRE)) return false;
+    xSemaphoreTake(s_mtx,portMAX_DELAY); *out=*s_prices; xSemaphoreGive(s_mtx); return true;
 }
-
-bool ha_sensor_meta(int index, ha_sensor_t *out) {
-    if (out == NULL || index < 0 || index >= ha_sensor_count()) {
-        return false;
-    }
-    ha_data_t d;
-    if (!ha_get(&d)) {
-        return false;
-    }
-    *out = d.sensors[index];
-    return true;
+bool ha_history_get(energy_history_t *out) {
+    if (!out || !__atomic_load_n(&s_started,__ATOMIC_ACQUIRE)) return false;
+    xSemaphoreTake(s_mtx,portMAX_DELAY); *out=s_history; xSemaphoreGive(s_mtx); return true;
 }
+void ha_history_request(int day) {
+    if (day!=0 && day!=-1) return;
+    __atomic_store_n(&s_day_offset,day,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&s_history_request,1,__ATOMIC_ACQ_REL);
+}
+const ha_sensor_t *ha_find_role(const ha_data_t *d,ha_role_t role) {
+    if (!d || role==HA_ROLE_NONE) return NULL;
+    for (int i=0;i<d->power_count;++i) if (d->power[i].role==role) return &d->power[i];
+    for (int i=0;i<d->count;++i) if (d->sensors[i].role==role) return &d->sensors[i];
+    return NULL;
+}
+const char *ha_role_entity(ha_role_t role) {
+    for (int i=0;i<COUNT(k_power_entities);++i) if (k_power_entities[i].role==role) return k_power_entities[i].entity_id;
+    return NULL;
+}
+int ha_sensor_count(void) { return COUNT(k_entities); }
+int ha_batt_count(void) { return COUNT(k_batt_entities); }
+bool ha_sensor_meta(int i,ha_sensor_t *out) {
+    if (!out || i<0 || i>=COUNT(k_entities) || !__atomic_load_n(&s_started,__ATOMIC_ACQUIRE)) return false;
+    xSemaphoreTake(s_mtx,portMAX_DELAY); *out=s_data.sensors[i]; xSemaphoreGive(s_mtx); return true;
+}
+bool ha_poll_pause(unsigned timeout) {
+    if (!__atomic_load_n(&s_started,__ATOMIC_ACQUIRE)) return true;
+    uint32_t gen=__atomic_add_fetch(&s_pause_gen,1,__ATOMIC_ACQ_REL);
+    __atomic_store_n(&s_pause_req,true,__ATOMIC_RELEASE);
+    for (unsigned elapsed=0;elapsed<timeout;elapsed+=20) {
+        if (__atomic_load_n(&s_ack_gen,__ATOMIC_ACQUIRE)==gen) return true;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return false; // request remains issued; every caller must resume on exit
+}
+void ha_poll_resume(void) { __atomic_store_n(&s_pause_req,false,__ATOMIC_RELEASE); }

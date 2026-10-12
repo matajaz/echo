@@ -2,7 +2,8 @@
   "temperature": [
     {
       "id": "sensor.ute_aquara_temperatur",
-      "name": "Ute-Aquara"
+      "name": "Ute-Aquara",
+      "role": "outdoor"
     },
     {
       "id": "sensor.ute_grund_temperatur",
@@ -18,7 +19,8 @@
     },
     {
       "id": "sensor.kok_sonoff_temperatur_2",
-      "name": "Kok"
+      "name": "Kok",
+      "role": "indoor"
     },
     {
       "id": "sensor.badrum_temperatur",
@@ -74,18 +76,33 @@
   "power": [
     {
       "id": "sensor.solar_power",
-      "name": "Sol",
+      "name": "Solar",
+      "role": "solar_power",
       "unit": "W"
     },
     {
       "id": "sensor.tibber_pulse_blomsterkungsvagen_416_power",
-      "name": "Hus",
+      "name": "Grid",
+      "role": "grid_power",
       "unit": "W"
     },
     {
-      "id": "sensor.sol_produktion_dag",
-      "name": "Sol idag",
+      "id": "sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_production",
+      "name": "Exported",
+      "role": "grid_export_today",
       "unit": "kWh"
+    },
+    {
+      "id": "sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_consumption",
+      "name": "Imported",
+      "role": "grid_import_today",
+      "unit": "kWh"
+    },
+    {
+      "id": "sensor.nordpool_kwh_se3_sek_3_10_025",
+      "name": "Price",
+      "role": "price",
+      "unit": "SEK/kWh"
     }
   ]
 }

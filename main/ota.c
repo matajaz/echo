@@ -40,6 +40,7 @@
 #include "secrets.h"
 #include "ota.h"
 #include "ha_client.h"
+#include "audio.h"
 
 static const char *TAG = "echo_ota";
 
@@ -488,6 +489,60 @@ static esp_err_t handle_reboot(httpd_req_t *req) {
     return ESP_OK;  // unreachable
 }
 
+// GET /beep?key=<OTA_KEY> — key-gated audio test. Posts a 1 kHz / 400 ms tone
+// to the audio service and returns the audio diagnostic so a 'no sound' report
+// can be pinned down remotely (did the command get accepted? did state cycle?
+// is the codec/PA path alive?). Not an OTA/safety action; same key gate.
+static esp_err_t handle_beep(httpd_req_t *req) {
+    char key[64] = {0};
+    if (ota_get_param(req, "key", key, sizeof(key)) != ESP_OK ||
+        !ota_key_matches(key, sizeof(key))) {
+        return ota_send_error(req, "401 Unauthorized", "bad key");
+    }
+    bool posted = audio_post_tone(1000, 400);
+    int pa = audio_pa_reassert_read();   // cached enable result; service owns PA hardware
+    int cregs = audio_read_codec_regs(); // ES8311 0x0D/0x12/0x32 packed
+    bool rdy = false, codec = false, muted = false; int vol = -1, err = 0;
+    audio_diag(&rdy, &codec, &vol, &muted, &err);
+    char body[288];
+    snprintf(body, sizeof(body),
+        "{\"posted\":%s,\"audio_ready\":%s,\"audio_codec\":%s,\"audio_vol\":%d,"
+        "\"audio_muted\":%s,\"audio_err\":%d,\"last_cmd\":%d,\"state\":%d,"
+        "\"pa_level\":%d,\"es8311_pwr\":%d,\"es8311_dacen\":%d,\"es8311_dacvol\":%d}\n",
+        posted ? "true" : "false", rdy ? "true" : "false", codec ? "true" : "false",
+        vol, muted ? "true" : "false", err, audio_diag_last_cmd(), audio_diag_state(), pa,
+        cregs < 0 ? -1 : (cregs >> 16) & 0xff,
+        cregs < 0 ? -1 : (cregs >> 8) & 0xff,
+        cregs < 0 ? -1 : cregs & 0xff);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+    ESP_LOGI(TAG, "/beep: posted=%d ready=%d codec=%d vol=%d err=%d", posted, rdy, codec, vol, err);
+    return ESP_OK;
+}
+
+// GET /play?key=<OTA_KEY>&name=<file.wav> — key-gated: stream a WAV song from
+// the LAN server (resolved under WAV_STREAM_PREFIX). Returns accept + audio
+// state. Same key gate as /beep; the filename is validated in audio.c
+// (no path traversal / scheme).
+static esp_err_t handle_play(httpd_req_t *req) {
+    char key[64] = {0}, name[64] = {0};
+    if (ota_get_param(req, "key", key, sizeof(key)) != ESP_OK ||
+        !ota_key_matches(key, sizeof(key))) {
+        return ota_send_error(req, "401 Unauthorized", "bad key");
+    }
+    if (ota_get_param(req, "name", name, sizeof(name)) != ESP_OK || name[0] == '\0') {
+        return ota_send_error(req, "400 Bad Request", "missing name");
+    }
+    bool ok = audio_post_wav(name);
+    char body[96];
+    snprintf(body, sizeof(body), "{\"accepted\":%s,\"name\":\"%s\"}\n",
+             ok ? "true" : "false", name);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+    ESP_LOGI(TAG, "/play '%s' accepted=%d", name, ok);
+    return ESP_OK;
+}
+
 static esp_err_t handle_info(httpd_req_t *req) {
     const esp_app_desc_t *app_desc = esp_app_get_description();
 
@@ -538,17 +593,50 @@ static esp_err_t handle_info(httpd_req_t *req) {
     static uint32_t s_boot_id = 0;
     if (s_boot_id == 0) s_boot_id = esp_random() | 1u;
 
-    char buf[480];
+    // Last reset reason (device-info + debugging an unexpected reboot).
+    const char *rr;
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   rr = "poweron";   break;
+        case ESP_RST_SW:        rr = "sw";        break;  // esp_restart()
+        case ESP_RST_PANIC:     rr = "panic";     break;  // crash
+        case ESP_RST_INT_WDT:   rr = "int_wdt";   break;
+        case ESP_RST_TASK_WDT:  rr = "task_wdt";  break;
+        case ESP_RST_WDT:       rr = "wdt";       break;
+        case ESP_RST_BROWNOUT:  rr = "brownout";  break;
+        case ESP_RST_DEEPSLEEP: rr = "deepsleep"; break;
+        case ESP_RST_SDIO:      rr = "sdio";      break;
+        default:                rr = "unknown";   break;
+    }
+
+    // Audio service diagnostic (debuggable without serial): is the audio
+    // service live, is the codec present, current volume/mute, last error.
+    bool a_ready = false, a_codec = false, a_muted = false;
+    int a_vol = -1, a_err = 0;
+    audio_diag(&a_ready, &a_codec, &a_vol, &a_muted, &a_err);
+
+    audio_path_diag_t path; audio_get_path_diag(&path);
+    char buf[1024];
     snprintf(buf, sizeof(buf),
         "{\"fw\":\"%s\",\"idf\":\"%s\",\"ota_in_progress\":%s,"
         "\"rssi\":%d,\"heap_free\":%u,\"heap_min\":%u,\"uptime_s\":%llu,"
         "\"dma_free\":%u,\"dma_largest\":%u,\"int_free\":%u,\"int_largest\":%u,"
-        "\"app_sha\":\"%s\",\"img_state\":\"%s\",\"boot_id\":%u}",
+        "\"app_sha\":\"%s\",\"img_state\":\"%s\",\"boot_id\":%u,"
+        "\"reset_reason\":\"%s\","
+        "\"audio_ready\":%s,\"audio_codec\":%s,\"audio_vol\":%d,"
+        "\"audio_muted\":%s,\"audio_err\":%d,"
+        "\"audio_state\":%d,\"audio_samples\":%lu,\"audio_nonzero\":%lu,\"audio_peak\":%lu,"
+        "\"audio_pa_level\":%d,\"audio_pa_err\":%d,\"audio_regs\":%d,"
+        "\"audio_clock1\":%d,\"audio_clock2\":%d,\"audio_format\":%d,\"audio_mute_reg\":%d}",
         app_desc->version, app_desc->idf_ver,
         ota_busy_get() ? "true" : "false",
         rssi, heap, min_heap, up_s,
         dma_free, dma_largest, int_free, int_largest,
-        sha_hex, state_str, (unsigned)s_boot_id);
+        sha_hex, state_str, (unsigned)s_boot_id,
+        rr,
+        a_ready ? "true" : "false", a_codec ? "true" : "false", a_vol,
+        a_muted ? "true" : "false", a_err,audio_diag_state(),
+        (unsigned long)path.samples,(unsigned long)path.nonzero_samples,(unsigned long)path.peak,
+        path.pa_level,path.pa_error,path.codec_regs,path.clock1,path.clock2,path.format,path.mute_reg);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
@@ -565,7 +653,7 @@ httpd_handle_t ota_server_start(void) {
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;  // /ota /info /reboot /log /log.txt /metrics + headroom
+    config.max_uri_handlers = 12;  // + /play (WAV stream)
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -593,6 +681,12 @@ httpd_handle_t ota_server_start(void) {
         .handler = handle_reboot,
     };
     httpd_register_uri_handler(server, &reboot_uri);
+
+    httpd_uri_t beep_uri = { .uri = "/beep", .method = HTTP_GET, .handler = handle_beep };
+    httpd_register_uri_handler(server, &beep_uri);
+
+    httpd_uri_t play_uri = { .uri = "/play", .method = HTTP_GET, .handler = handle_play };
+    httpd_register_uri_handler(server, &play_uri);
 
     // Start the transfer supervisor: an independent watchdog that force-reboots
     // a wedged OTA past OTA_TRANSFER_DEADLINE_US (see ota_supervisor_cb). Failing

@@ -1,0 +1,23 @@
+menu "Echo board calibration"
+config ECHO_NO_STORAGE
+    bool "House has no electrical storage (enable derived live house load)"
+    default n
+    help
+        Only enable when grid power means import power, a separate grid export
+        power role is configured, and no battery charge/discharge needs to be
+        accounted for. The panel then derives solar + import - export.
+config ECHO_BATTERY_ADC_EMPTY
+    int "Battery ADC at discharged reference"
+    range 1 1022
+    default 300
+    help
+        Measure the actual pack voltage and ADC. SOC remains an estimate;
+        these default bounds are provisional, not a calibrated fuel gauge.
+config ECHO_BATTERY_ADC_FULL
+    int "Battery ADC at charged reference"
+    range 2 1023
+    default 410
+    help
+        Must exceed the discharged reference. Calibrate using measured pack
+        voltage rather than assuming a USB-connected reading is full charge.
+endmenu

@@ -1,304 +1,108 @@
-// echo -- consolidated single-graph page (see ui_graphs.h).
-//
-// One large graph shows ONE metric, chosen from a dropdown. The metric table
-// below drives everything (title, colour, Y range, units, data source), so
-// adding a metric is a one-line table entry.
-
 #include "ui_graphs.h"
-
-#include "sensors.h"
-#include "esp_log.h"
+#include "ui/ui_widgets.h"
+#include "chart_history.h"
 #include "esp_timer.h"
-#include "esp_lvgl_port.h"
-#include "lvgl.h"
-
+#include "esp_heap_caps.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-
-static const char *TAG = "ui_graphs";
-
-#define N_POINTS     60            // 60 x 2 s = 120 s = "last 2 min"
-#define SAMPLE_MS    2000
-#define VAL_X10      10            // chart stores value * 10 (keeps C/F/K/.. as ints)
-#define TITLE_Y      4
-#define DD_Y         28
-#define CHART_Y      68
-#define CARD_H       66
-#define CHART_H      (320 - CHART_Y - CARD_H - 4)   // 182 px
-#define CHART_W      220
-#define CARD_W       232
-
-// ---- unit tables (affine: display = base*mul + add) --------------------
-static const char *const TEMP_U[] = {"C", "F", "K"};
-static const float TEMP_M[] = {1.0f, 1.8f, 1.0f};
-static const float TEMP_A[] = {0.0f, 32.0f, 273.15f};
-static const char *const ONE_U[] = {"%"};
-static const char *const SPD_U[] = {"m/s2"};
-static const char *const GYR_U[] = {"dps"};
-static const float ONE_M[] = {1.0f};
-static const float ONE_A[] = {0.0f};
-
-static bool base_temp(float *v) {
-    sensors_data_t d;
-    if (!sensors_get(&d)) return false;
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (!sensors_group_fresh_at(d.th_last_ms, now)) return false;
-    if (v) *v = d.temp_c;
-    return true;
-}
-static bool base_hum(float *v) {
-    sensors_data_t d;
-    if (!sensors_get(&d)) return false;
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (!sensors_group_fresh_at(d.th_last_ms, now)) return false;
-    if (v) *v = d.humidity_rh;
-    return true;
-}
-static bool base_acc(float *v) {
-    sensors_data_t d;
-    if (!sensors_get(&d)) return false;
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (!sensors_group_fresh_at(d.imu_last_ms, now)) return false;
-    if (v) *v = sqrtf(d.accel_x * d.accel_x + d.accel_y * d.accel_y + d.accel_z * d.accel_z);
-    return true;
-}
-static bool base_gyr(float *v) {
-    sensors_data_t d;
-    if (!sensors_get(&d)) return false;
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (!sensors_group_fresh_at(d.imu_last_ms, now)) return false;
-    if (v) *v = sqrtf(d.gyro_x * d.gyro_x + d.gyro_y * d.gyro_y + d.gyro_z * d.gyro_z);
-    return true;
-}
-static bool base_soc(float *v) {
-    sensors_data_t d;
-    if (!sensors_get(&d)) return false;
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (!sensors_group_fresh_at(d.bat_last_ms, now)) return false;
-    if (v) *v = (float)d.bat_soc_pct;
-    return true;
-}
-
+#define METRIC_COUNT 5
+#define RANGE_COUNT 4
+static const uint64_t periods[RANGE_COUNT]={2000000,10000000,60000000,1440000000};
+static const uint32_t colors[METRIC_COUNT]={0xff8040,0x40c0ff,0x40ff80,0xffd040,0x90c0ff};
+static const char *const units[METRIC_COUNT]={"°C","%","m/s2","dps","% est."};
+static const char *const labels[RANGE_COUNT]={"2 min","10 min","1 hour","24 hours"};
+static const char *const left_labels[RANGE_COUNT]={"-2m","-10m","-1h","-24h"};
+static const char *const middle_labels[RANGE_COUNT]={"-1m","-5m","-30m","-12h"};
 typedef struct {
-    const char *name;          // dropdown entry + chart title
-    const char *const *units;  // unit labels
-    const float *mul;          // affine mul per unit
-    const float *add;          // affine add per unit
-    int n_units;
-    float base_min, base_max;  // Y range in BASE units (unit 0 = identity)
-    uint32_t color_hex;
-    bool (*get)(float *base_out);
-} metric_t;
-
-static const metric_t METRICS[] = {
-    {"Temperature", TEMP_U, TEMP_M, TEMP_A, 3, 15.0f, 40.0f, 0xff8040, base_temp},
-    {"Humidity",    ONE_U,  ONE_M,  ONE_A,  1,  0.0f, 100.0f, 0x40c0ff, base_hum},
-    {"Accel |a|",   SPD_U,  ONE_M,  ONE_A,  1,  0.0f, 20.0f,  0x40ff80, base_acc},
-    {"Gyro |w|",    GYR_U,  ONE_M,  ONE_A,  1,  0.0f, 500.0f, 0xffd040, base_gyr},
-    {"Battery",     ONE_U,  ONE_M,  ONE_A,  1,  0.0f, 100.0f, 0x90c0ff, base_soc},
-};
-#define N_METRICS ((int)(sizeof(METRICS) / sizeof(METRICS[0])))
-
-// ---- state -------------------------------------------------------------
-static lv_obj_t  *s_dd = NULL;      // dropdown (metric picker)
-static lv_obj_t  *s_chart = NULL;
-static lv_chart_series_t *s_ser = NULL;
-static lv_obj_t  *s_title = NULL;
-static lv_obj_t  *s_card = NULL;    // value card (tap = cycle unit)
-static lv_obj_t  *s_val = NULL;     // big value + unit
-static lv_obj_t  *s_stats = NULL;   // min/max/avg line (small font)
-static lv_timer_t *s_timer = NULL;
-
-static int s_idx = 0;               // selected metric index
-static int s_unit = 0;              // selected unit index for that metric
-
-typedef struct { bool any; float lo, hi, last; double sum; int n; } sampler_t;
-static sampler_t s_samp;
-
-static inline float disp_of(const metric_t *m, int u, float base) {
-    return base * m->mul[u] + m->add[u];
+    lv_obj_t *root,*metric,*chart,*current,*stats,*history_note,*ranges[RANGE_COUNT];
+    lv_chart_series_t *series;
+    lv_timer_t *collector;
+    chart_history_t history[METRIC_COUNT][RANGE_COUNT];
+    int selected,range;
+    uint64_t last_draw,started;
+    bool dirty;
+} graphs_t;
+static bool values(const sensors_data_t *s,uint64_t now,float out[METRIC_COUNT],bool valid[METRIC_COUNT]) {
+    bool th=sensors_group_fresh_at(s->th_last_us,now),imu=sensors_group_fresh_at(s->imu_last_us,now);
+    valid[0]=valid[1]=th; valid[2]=valid[3]=imu; valid[4]=s->bat_ok&&sensors_group_fresh_at(s->bat_last_us,now);
+    out[0]=s->temp_c; out[1]=s->humidity_rh;
+    out[2]=sqrtf(s->accel_x*s->accel_x+s->accel_y*s->accel_y+s->accel_z*s->accel_z);
+    out[3]=sqrtf(s->gyro_x*s->gyro_x+s->gyro_y*s->gyro_y+s->gyro_z*s->gyro_z);
+    out[4]=s->bat_soc_pct; return true;
 }
-static void samp_reset(void) { memset(&s_samp, 0, sizeof(s_samp)); }
-static void samp_add(float base) {
-    if (!s_samp.any) { s_samp.lo = s_samp.hi = s_samp.last = base; s_samp.any = true; }
-    else {
-        if (base < s_samp.lo) s_samp.lo = base;
-        if (base > s_samp.hi) s_samp.hi = base;
-        s_samp.last = base;
+static void collect(lv_timer_t *timer) {
+    graphs_t *s=timer->user_data; sensors_data_t data;
+    if (!sensors_get(&data)) return;
+    float v[METRIC_COUNT]; bool valid[METRIC_COUNT]; uint64_t now=esp_timer_get_time();
+    values(&data,now,v,valid);
+    for (int i=0;i<METRIC_COUNT;++i) if (valid[i]) for (int range=0;range<RANGE_COUNT;++range)
+        chart_history_add(&s->history[i][range],now/periods[range],v[i]);
+}
+static void metric_changed(lv_event_t *e) {
+    graphs_t *s=lv_event_get_user_data(e); s->selected=lv_dropdown_get_selected(s->metric); s->dirty=true;
+}
+static void range_changed(lv_event_t *e) {
+    graphs_t *s=lv_event_get_user_data(e);
+    for (int i=0;i<RANGE_COUNT;++i) if (lv_event_get_target(e)==s->ranges[i]) s->range=i;
+    s->dirty=true;
+}
+static void ticks(lv_event_t *e) {
+    graphs_t *s=lv_event_get_user_data(e); lv_obj_draw_part_dsc_t *d=lv_event_get_draw_part_dsc(e);
+    if (!d || !d->text || d->part!=LV_PART_TICKS || d->id!=LV_CHART_AXIS_PRIMARY_X) return;
+    lv_snprintf(d->text,d->text_length,"%s",d->value==0?left_labels[s->range]:d->value==2?"now":middle_labels[s->range]);
+}
+void *ui_graphs_create(lv_obj_t *root) {
+    graphs_t *s=heap_caps_calloc(1,sizeof(*s),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT); if (!s) return NULL;
+    s->root=root; s->started=esp_timer_get_time(); s->dirty=true;
+    s->metric=ui_dropdown(root,"Board temperature\nBoard humidity\nAccel magnitude\nGyro magnitude\nBattery estimate");
+    lv_obj_set_size(s->metric,224,30); lv_obj_add_event_cb(s->metric,metric_changed,LV_EVENT_VALUE_CHANGED,s);
+    s->chart=ui_chart(root,120,LV_CHART_TYPE_LINE); lv_chart_set_point_count(s->chart,CHART_HISTORY_POINTS);
+    s->series=lv_chart_add_series(s->chart,lv_color_hex(ECHO_BLUE),LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_all_value(s->chart,s->series,LV_CHART_POINT_NONE);
+    lv_obj_add_event_cb(s->chart,ticks,LV_EVENT_DRAW_PART_BEGIN,s);
+    s->current=ui_label(root,"Current: --",ECHO_FONT_READ,ECHO_TEXT);
+    s->stats=ui_label(root,"Min -- / Max -- / Avg --",ECHO_FONT_SMALL,ECHO_TEXT_DIM);
+    s->history_note=ui_label(root,"History fills since boot",ECHO_FONT_SMALL,ECHO_TEXT_DIM);
+    lv_obj_t *row=ui_row(root,224,28,4);
+    for (int i=0;i<RANGE_COUNT;++i) s->ranges[i]=ui_button(row,labels[i],53,28,range_changed,s);
+    s->collector=lv_timer_create(collect,2000,s); collect(s->collector); return s;
+}
+void ui_graphs_update(void *state,const ui_model_t *m) {
+    graphs_t *s=state; float v[METRIC_COUNT]={0}; bool valid[METRIC_COUNT]={0};
+    if (m->have_sensors) values(&m->sensors,m->now_us,v,valid);
+    char text[128];
+    if (valid[s->selected]) snprintf(text,sizeof(text),"Current: %.1f %s",v[s->selected],units[s->selected]);
+    else snprintf(text,sizeof(text),"Current: -- (sensor stale)");
+    ui_text(s->current,text);
+    lv_obj_set_style_text_color(s->current,lv_color_hex(valid[s->selected]?colors[s->selected]:ECHO_TEXT_DIM),0);
+    if (s->dirty || m->now_us-s->last_draw>=2000000) {
+        uint64_t slot=m->now_us/periods[s->range]; chart_history_t *h=&s->history[s->selected][s->range];
+        chart_stats_t stats=chart_history_stats(h,slot);
+        float lo=stats.valid?stats.min:0,hi=stats.valid?stats.max:1;
+        if (hi-lo<1) { lo-=.5f; hi+=.5f; }
+        lv_chart_set_series_color(s->chart,s->series,lv_color_hex(colors[s->selected]));
+        lv_chart_set_range(s->chart,LV_CHART_AXIS_PRIMARY_Y,(int)floorf(lo*10),(int)ceilf(hi*10));
+        for (int i=0;i<CHART_HISTORY_POINTS;++i) {
+            int age=CHART_HISTORY_POINTS-1-i; int value=LV_CHART_POINT_NONE;
+            if (slot>=(uint64_t)age) {
+                uint64_t expected=slot-age; chart_bucket_t *b=&h->buckets[expected%CHART_HISTORY_POINTS];
+                if (b->slot==expected+1 && b->count) value=(int)lround(b->sum/b->count*10);
+            }
+            lv_chart_set_value_by_id(s->chart,s->series,i,value);
+        }
+        lv_chart_refresh(s->chart);
+        if (stats.valid) snprintf(text,sizeof(text),"Min %.1f / Max %.1f / Avg %.1f",stats.min,stats.max,stats.average);
+        else snprintf(text,sizeof(text),"Min -- / Max -- / Avg --");
+        ui_text(s->stats,text);
+        uint64_t window=periods[s->range]*CHART_HISTORY_POINTS;
+        ui_text(s->history_note,m->now_us-s->started<window?"Partial history since boot":"Selected window / missing = gaps");
+        for (int i=0;i<RANGE_COUNT;++i) ui_button_accent(s->ranges[i],i==s->range?ECHO_ACTION:ECHO_BUTTON);
+        s->last_draw=m->now_us; s->dirty=false;
     }
-    s_samp.sum += base;
-    s_samp.n++;
 }
-
-// Rewrite the X-axis ticks to relative time (mirrors the old chart page).
-static void chart_x_labels_cb(lv_event_t *e) {
-    lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
-    if (dsc == NULL || dsc->text == NULL) return;
-    if (!(dsc->part == LV_PART_TICKS && dsc->id == LV_CHART_AXIS_PRIMARY_X)) return;
-    switch (dsc->value) {
-        case 0:  lv_snprintf(dsc->text, dsc->text_length, "-2m"); break;
-        case 1:  lv_snprintf(dsc->text, dsc->text_length, "-1m"); break;
-        default: lv_snprintf(dsc->text, dsc->text_length, "now"); break;
-    }
-}
-
-static void apply_range(void) {
-    const metric_t *m = &METRICS[s_idx];
-    int rmin = (int)lroundf(disp_of(m, s_unit, m->base_min) * VAL_X10);
-    int rmax = (int)lroundf(disp_of(m, s_unit, m->base_max) * VAL_X10);
-    lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, rmin, rmax);
-    lv_chart_set_all_value(s_chart, s_ser, LV_CHART_POINT_NONE);
-    lv_chart_refresh(s_chart);
-}
-
-static void push_point(void) {
-    const metric_t *m = &METRICS[s_idx];
-    float base;
-    int32_t pt = LV_CHART_POINT_NONE;
-    if (m->get(&base)) {
-        samp_add(base);
-        pt = (int32_t)lroundf(disp_of(m, s_unit, base) * VAL_X10);
-    }
-    lv_chart_set_next_value(s_chart, s_ser, pt);
-    lv_chart_refresh(s_chart);
-}
-
-static void update_readout(void) {
-    const metric_t *m = &METRICS[s_idx];
-    if (!s_samp.any) {
-        lv_label_set_text(s_val, "--");
-        lv_label_set_text(s_stats, "waiting for data...");
-        return;
-    }
-    char v[32], st[56];
-    const char *u = m->units[s_unit];
-    snprintf(v, sizeof(v), "%.1f %s", disp_of(m, s_unit, s_samp.last), u);
-    double avg = s_samp.sum / (s_samp.n ? s_samp.n : 1);
-    snprintf(st, sizeof(st), "min %.1f  max %.1f  avg %.1f",
-             disp_of(m, s_unit, s_samp.lo), disp_of(m, s_unit, s_samp.hi),
-             disp_of(m, s_unit, (float)avg));
-    lv_label_set_text(s_val, v);
-    lv_label_set_text(s_stats, st);
-}
-
-// (Re)initialise the chart + readout for the current metric/unit.
-static void rebuild(void) {
-    const metric_t *m = &METRICS[s_idx];
-    lv_label_set_text(s_title, m->name);
-    lv_chart_set_series_color(s_chart, s_ser, lv_color_hex(m->color_hex));
-    samp_reset();
-    apply_range();
-    update_readout();
-    push_point();
-}
-
-static void card_cb(lv_event_t *e) {
-    const metric_t *m = &METRICS[s_idx];
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (m->n_units <= 1) return;          // nothing to cycle
-    s_unit = (s_unit + 1) % m->n_units;
-    samp_reset();
-    apply_range();
-    update_readout();
-    push_point();
-}
-
-static void dd_cb(lv_event_t *e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    uint16_t sel = lv_dropdown_get_selected(s_dd);
-    if (sel >= (uint16_t)N_METRICS) sel = 0;
-    s_idx = sel;
-    s_unit = 0;
-    rebuild();
-}
-
-static void tick_cb(lv_timer_t *t) {
-    (void)t;
-    if (s_chart == NULL) return;
-    push_point();
-    update_readout();
-}
-
-void ui_graphs_create(lv_obj_t *tile) {
-    if (!lvgl_port_lock(2000)) {
-        ESP_LOGE(TAG, "LVGL lock timeout in create");
-        return;
-    }
-
-    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(tile, lv_color_hex(0x101418), LV_PART_MAIN);
-
-    s_title = lv_label_create(tile);
-    lv_obj_set_style_text_color(s_title, lv_color_hex(0x30d070), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_title, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_label_set_text(s_title, "graph");
-    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
-
-    // Metric picker. LV_USE_DROPDOWN / LV_USE_DROPDOWN_LIST are enabled.
-    s_dd = lv_dropdown_create(tile);
-    lv_obj_set_style_text_font(s_dd, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_dropdown_set_options(s_dd,
-        "Temperature\nHumidity\nAccel |a|\nGyro |w|\nBattery");
-    lv_dropdown_set_selected(s_dd, 0);
-    lv_obj_set_size(s_dd, 168, 32);
-    lv_obj_align(s_dd, LV_ALIGN_TOP_LEFT, 6, DD_Y);
-    lv_obj_add_flag(s_dd, LV_OBJ_FLAG_GESTURE_BUBBLE);   // let swipes page
-    lv_obj_add_event_cb(s_dd, dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    // The one graph.
-    s_chart = lv_chart_create(tile);
-    lv_obj_set_size(s_chart, CHART_W, CHART_H);
-    lv_obj_align(s_chart, LV_ALIGN_TOP_MID, 0, CHART_Y);
-    lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(s_chart, N_POINTS);
-    lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
-    lv_obj_set_style_text_font(s_chart, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_Y, 4, 2, 3, 1, true, 40);
-    lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_X, 4, 2, 3, 1, true, 24);
-    lv_obj_add_event_cb(s_chart, chart_x_labels_cb, LV_EVENT_DRAW_PART_BEGIN, NULL);
-    // Charts are clickable+scrollable by default and would eat the page swipe.
-    lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(s_chart, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_chart, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_flag(s_chart, LV_OBJ_FLAG_EVENT_BUBBLE);
-    s_ser = lv_chart_add_series(s_chart, lv_color_hex(METRICS[0].color_hex),
-                                LV_CHART_AXIS_PRIMARY_Y);
-
-    // Value card: big number (tap = cycle unit) + small min/max/avg line.
-    s_card = lv_obj_create(tile);
-    lv_obj_set_size(s_card, CARD_W, CARD_H);
-    lv_obj_align(s_card, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_obj_set_style_bg_color(s_card, lv_color_hex(0x181c22), LV_PART_MAIN);
-    lv_obj_set_style_radius(s_card, 8, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_card, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(s_card, lv_color_hex(0x2a3140), LV_PART_MAIN);
-    lv_obj_clear_flag(s_card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_card, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(s_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_event_cb(s_card, card_cb, LV_EVENT_CLICKED, NULL);
-
-    s_val = lv_label_create(s_card);
-    lv_obj_set_style_text_color(s_val, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_label_set_text(s_val, "--");
-    lv_obj_align(s_val, LV_ALIGN_TOP_LEFT, 2, 0);
-
-    s_stats = lv_label_create(s_card);
-    lv_obj_set_style_text_color(s_stats, lv_color_hex(0x9aa4b2), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_stats, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_label_set_text(s_stats, "");
-    lv_obj_align(s_stats, LV_ALIGN_BOTTOM_LEFT, 2, -2);
-
-    rebuild();
-    s_timer = lv_timer_create(tick_cb, SAMPLE_MS, NULL);
-
-    lvgl_port_unlock();
-    ESP_LOGI(TAG, "graph page ready (%d metrics)", N_METRICS);
-}
-
-void ui_graphs_destroy(void) {
-    if (s_timer) { lv_timer_del(s_timer); s_timer = NULL; }
-    s_dd = s_chart = NULL;
-    s_ser = NULL;
-    s_title = s_card = s_val = s_stats = NULL;
+void ui_graphs_destroy(void *state) {
+    graphs_t *s=state; if (!s) return; if (s->collector) lv_timer_del(s->collector);
+    lv_obj_del(s->root); free(s);
 }

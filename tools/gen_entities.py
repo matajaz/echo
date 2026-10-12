@@ -6,7 +6,7 @@ Reads catalogue/entities.yaml and generates:
   - core/test/fixtures/ha_entities.json : a fixture for host tests
 
 Validates: section counts (<=8), entity_id form `domain.object_id` (lowercase
-+ digits/underscore), lengths (id<=63, name<=23), no duplicate ids. Any
++ digits/underscore), lengths (id<=79, name<=23), no duplicate ids. Any
 violation aborts with a clear message and a non-zero exit (so a bad catalogue
 fails generation, never produces a silently-wrong firmware). No third-party
 deps: a tiny purpose-built parser handles this flat catalogue (no PyYAML).
@@ -26,8 +26,13 @@ CATALOGUE = ROOT / "catalogue" / "entities.yaml"
 HEADER = ROOT / "main" / "ha_entities.generated.h"
 FIXTURE = ROOT / "core" / "test" / "fixtures" / "ha_entities.json"
 
-MAX_PER_SECTION = 9
-MAX_ID = 63
+MAX_PER_SECTION = {"temperature": 9, "battery": 8, "power": 6}
+ROLES = {r: "HA_ROLE_" + r.upper() for r in (
+    "none", "outdoor", "indoor", "solar_power", "grid_power", "grid_export_power",
+    "grid_export_today", "grid_import_today", "price", "solar_today")}
+ROLE_SECTION = {"outdoor": "temperature", "indoor": "temperature",
+                **{r: "power" for r in ROLES if r not in ("none", "outdoor", "indoor")}}
+MAX_ID = 79
 MAX_NAME = 23
 _ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 
@@ -76,11 +81,11 @@ def parse_catalogue(text: str) -> dict[str, list[dict[str, str]]]:
                 raise CatalogueError(f"'name' without a preceding '- id': {line!r}")
             cur_item["name"] = m.group(1)
             continue
-        m = re.match(r"^\s+unit:\s*(\S+)\s*$", line)
+        m = re.match(r"^\s+(unit|role):\s*(\S+)\s*$", line)
         if m:
             if cur_item is None:
                 raise CatalogueError(f"'unit' without a preceding '- id': {line!r}")
-            cur_item["unit"] = m.group(1)
+            cur_item[m.group(1)] = m.group(2)
             continue
         raise CatalogueError(f"unparseable line: {line!r}")
     if not version_seen:
@@ -90,9 +95,11 @@ def parse_catalogue(text: str) -> dict[str, list[dict[str, str]]]:
 
 def validate(sections: dict[str, list[dict[str, str]]]) -> None:
     """Raise CatalogueError on any invalid entry; otherwise return cleanly."""
+    all_roles = set()
     for sect, items in sections.items():
-        if len(items) > MAX_PER_SECTION:
-            raise CatalogueError(f"{sect}: {len(items)} entries exceeds max {MAX_PER_SECTION}")
+        limit = MAX_PER_SECTION[sect]
+        if len(items) > limit:
+            raise CatalogueError(f"{sect}: {len(items)} entries exceeds max {limit}")
         seen: set[str] = set()
         for it in items:
             eid, name = it["id"], it["name"]
@@ -104,43 +111,40 @@ def validate(sections: dict[str, list[dict[str, str]]]) -> None:
                 raise CatalogueError(f"{sect}: {eid} has an empty name")
             if len(name) > MAX_NAME:
                 raise CatalogueError(f"{sect}: name {name!r} exceeds {MAX_NAME} chars")
-            if '"' in name or '"' in eid:
+            if len(name.encode("utf-8")) > MAX_NAME:
+                raise CatalogueError(f"{sect}: name exceeds {MAX_NAME} UTF-8 bytes")
+            role = it.get("role", "none")
+            if role not in ROLES or (role != "none" and ROLE_SECTION[role] != sect):
+                raise CatalogueError(f"{sect}: invalid role {role!r}")
+            if role != "none":
+                if role in all_roles: raise CatalogueError(f"duplicate role {role!r}")
+                all_roles.add(role)
+            if sect == "power" and role == "none":
+                raise CatalogueError("power entries require a semantic role")
+            unit = it.get("unit", "C" if sect == "temperature" else "%")
+            if sect != "power" and unit != ("C" if sect == "temperature" else "%"):
+                raise CatalogueError(f"{sect}: unit must be canonical")
+            expected = {"price": "SEK/kWh", "grid_import_today": "kWh", "grid_export_today": "kWh", "solar_today": "kWh"}.get(role, "W")
+            if sect == "power" and unit != expected:
+                raise CatalogueError(f"{role}: expected unit {expected}")
+            if any(c in name for c in ('"', '\\')):
                 raise CatalogueError(f"{sect}: quote in {eid!r}/{name!r}")
             if eid in seen:
                 raise CatalogueError(f"{sect}: duplicate entity_id {eid!r}")
             seen.add(eid)
 
 
-def _c_array(name: str, items: list[dict[str, str]]) -> str:
-    rows = "".join(f'    {{ "{it["id"]}", "{it["name"]}" }},\n' for it in items)
-    return f"static const ha_entity_def_t {name}[] = {{\n{rows}}};\n"
-
-
-def _c_power_array(name: str, items: list[dict[str, str]]) -> str:
-    """Power entries carry a unit (W or kWh); render a 3-field array."""
-    rows = "".join(
-        f'    {{ "{it["id"]}", "{it["name"]}", "{it.get("unit", "")}" }},\n'
-        for it in items)
-    return f"static const ha_power_def_t {name}[] = {{\n{rows}}};\n"
-
-
 def render_header(sections: dict[str, list[dict[str, str]]]) -> str:
-    """Render the generated C header from the validated catalogue."""
-    temp = sections.get("temperature", [])
-    batt = sections.get("battery", [])
-    power = sections.get("power", [])
-    return (
-        "// GENERATED by tools/gen_entities.py from catalogue/entities.yaml.\n"
-        "// DO NOT EDIT BY HAND — edit the catalogue and regenerate.\n"
-        "#pragma once\n\n"
-        "typedef struct { const char *entity_id; const char *name; } ha_entity_def_t;\n"
-        "typedef struct { const char *entity_id; const char *name; const char *unit; } ha_power_def_t;\n\n"
-        + _c_array("k_entities", temp)
-        + "\n"
-        + _c_array("k_batt_entities", batt)
-        + "\n"
-        + _c_power_array("k_power_entities", power)
-    )
+    text = '// GENERATED by tools/gen_entities.py. Edit catalogue/entities.yaml.\n#pragma once\n#include "ha_model.h"\n\n'
+    text += 'typedef struct { const char *entity_id, *name, *unit; ha_role_t role; } ha_entity_def_t;\n'
+    for sect, array, cap in (("temperature", "k_entities", "HA_MAX_SENSORS"), ("battery", "k_batt_entities", "HA_MAX_BATT"), ("power", "k_power_entities", "HA_MAX_POWER")):
+        text += f"static const ha_entity_def_t {array}[] = {{\n"
+        for item in sections.get(sect, []):
+            unit = item.get("unit", "C" if sect == "temperature" else "%")
+            text += f'    {{ "{item["id"]}", "{item["name"]}", "{unit}", {ROLES[item.get("role", "none")]} }},\n'
+        text += '};\n'
+        text += f'_Static_assert(sizeof({array}) / sizeof({array}[0]) <= {cap}, "{sect} capacity");\n\n'
+    return text.rstrip() + "\n"
 
 
 def main(argv: list[str]) -> int:

@@ -213,7 +213,7 @@ PREV_UPTIME=""      # V09: previous uptime_s, to detect a reboot via an uptime R
 # between two polls (fast boot) is still caught by the uptime going backwards.
 BASE_INFO=$(curl -s --max-time 5 "http://${BOARD_IP}/info" 2>/dev/null || true)
 PREV_UPTIME=$(echo "$BASE_INFO" | grep -o '"uptime_s":[0-9]*' | head -1 | cut -d: -f2 || true)
-for i in $(seq 1 24); do
+for i in $(seq 1 30); do
     sleep 5
     INFO=$(curl -s --max-time 5 "http://${BOARD_IP}/info" 2>/dev/null || true)
     if [ -z "$INFO" ]; then
@@ -239,18 +239,21 @@ for i in $(seq 1 24); do
         continue
     fi
     # idle response: check the version FRESH on THIS response (not a memory).
-    # V09: also read img_state — a right-version image that is still PENDING or
-    # has rolled back/aborted must NOT count toward stable success. Only an
-    # img_state we can confirm as valid (or benign pending while probation runs)
-    # advances the soak; invalid/aborted resets it. This mirrors the host-tested
-    # ota_identity_accept policy (core/ota_identity.h) in shell form.
+    # N01 (v85): success requires the device to report img_state==VALID (the
+    # app CONFIRMED the image). A right-version image that is still
+    # pending_verify / unknown / has no img_state field is NOT success yet —
+    # it HOLDS the soak (waits) rather than advancing toward SUCCESS; a later
+    # probation rejection would roll it back. invalid/aborted resets. This
+    # mirrors the host-tested ota_identity_accept policy in shell form.
     IMG_STATE=$(echo "$INFO" | grep -o '"img_state":"[a-z_]*"' | head -1 | cut -d: -f2 | tr -d '"' || true)
     if echo "$INFO" | grep -q "\"fw\":\"${NEW_VER}\""; then
         case "$IMG_STATE" in
+            valid)
+                SOAK=$((SOAK + 1)) ;;           # CONFIRMED image -> advance toward success
             invalid|aborted)
-                SOAK=0 ;;                       # right version but rejected -> not success
+                SOAK=0 ;;                       # rejected image -> reset
             *)
-                SOAK=$((SOAK + 1)) ;;           # valid / pending_verify / (field absent) -> probation
+                : ;;                            # pending/unknown/absent -> WAIT (hold, don't advance)
         esac
     else
         SOAK=0                     # not the new version (e.g. rolled back) -> reset

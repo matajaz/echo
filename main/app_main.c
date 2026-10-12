@@ -11,6 +11,8 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
+#include <time.h>
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -60,7 +62,12 @@ static inline bool wifi_have_fallback(void) {
     return WIFI_SSID_2[0] != '\0';
 }
 
-// Load profile `idx` into the STA config and apply it. Returns the SSID in use.
+// Load profile `idx` into the STA config and apply it. Returns the SSID in use,
+// or NULL if the config could not be applied. N08: a 32-byte SSID is LEGAL and
+// the esp_wifi ssid[32] field does NOT require a terminator at full width, so a
+// strlcpy (which keeps only 31 bytes) would truncate it. Copy into a ZEROED
+// config with memcpy bounded by the real length (<=32). The profile index is
+// updated ONLY after esp_wifi_set_config() succeeds.
 static const char *wifi_apply_profile(int idx) {
     const char *ssid = (idx == 1) ? WIFI_SSID_2 : WIFI_SSID;
     const char *pass = (idx == 1) ? WIFI_PASS_2 : WIFI_PASS;
@@ -76,10 +83,21 @@ static const char *wifi_apply_profile(int idx) {
     // An open hotspot (empty password) must advertise OPEN authmode, else the
     // join is rejected on threshold. A phone hotspot normally has a password.
     if (pass[0] == '\0') cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
+    // SSID: full-width copy (cfg is zero-initialized above, so a <32-byte SSID
+    // is naturally NUL-padded; a 32-byte SSID fills the field with no loss).
+    // SSID comes from a compile-time literal (NUL-terminated); cap at the field.
+    size_t slen = strlen(ssid);
+    if (slen > sizeof(cfg.sta.ssid)) slen = sizeof(cfg.sta.ssid);
+    memcpy(cfg.sta.ssid, ssid, slen);
+    // Password field is 64 bytes and the driver treats it as a C string, so a
+    // NUL-terminated copy is correct here.
     strlcpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password));
-    esp_wifi_set_config(WIFI_IF_STA, &cfg);
-    s_wifi_profile = idx;
+    esp_err_t cr = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (cr != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_apply_profile(%d) set_config failed: 0x%x", idx, cr);
+        return NULL;                 // leave s_wifi_profile unchanged
+    }
+    s_wifi_profile = idx;            // only after a successful apply
     return ssid;
 }
 
@@ -202,8 +220,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         if (wifi_have_fallback() && r > 0 && (r % WIFI_PROFILE_SWITCH_AT) == 0) {
             int next = s_wifi_profile ? 0 : 1;
             const char *ss = wifi_apply_profile(next);
-            ESP_LOGW(TAG, "WiFi: %d failures on previous SSID — switching to \"%s\" (profile %d)",
-                     r, ss, next);
+            if (ss != NULL) {
+                ESP_LOGW(TAG, "WiFi: %d failures on previous SSID — switching to \"%s\" (profile %d)",
+                         r, ss, next);
+            } else {
+                ESP_LOGE(TAG, "WiFi: profile switch to %d failed to apply; staying on current", next);
+            }
         }
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK && (r <= WIFI_MAX_RETRY || (r % 15) == 0)) {
@@ -398,6 +420,8 @@ static httpd_handle_t start_http_stack(void) {
     return NULL;
 }
 
+static void clock_synced(struct timeval *timeval) { (void)timeval; sensors_clock_synced(); }
+
 void app_main(void) {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -428,6 +452,16 @@ void app_main(void) {
         ESP_LOGW(TAG, "No WiFi yet -- starting all services anyway; the perpetual "
                       "reconnect will bring OTA/web online once the AP returns.");
     }
+
+    // SNTP: get a trustworthy wall clock for the Overview time (the RTC is not
+    // NTP-synced; uptime is not a civil time). Swedish tz with DST. Non-fatal —
+    // the UI shows "--:--" until the first sync lands. Safe to call before the
+    // link is up; it syncs when connectivity arrives.
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    sntp_cfg.sync_cb=clock_synced;
+    esp_netif_sntp_init(&sntp_cfg);
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);   // Europe/Stockholm
+    tzset();
 
     httpd_handle_t server = start_http_stack();
     if (server == NULL) {
@@ -611,7 +645,11 @@ void app_main(void) {
         readiness_input_t rin = {
             .maintenance_ready = (server != NULL),
             .ui_ready = s_ui_ready,
-            .input_ready = s_input_ready || s_ui_ready, // LVGL owns touch when up
+            // N07: pass the ACTUAL touch readiness — do NOT OR it with ui_ready.
+            // A working LCD/LVGL does not imply a working touch input device; a
+            // display-only startup with failed touch must classify DEGRADED, not
+            // FULL, so the readiness verdict is an honest usability assessment.
+            .input_ready = s_input_ready,
             .last_heartbeat_ms = now_ms,                // this tick IS the heartbeat
             .stable_ticks = stable_ticks,
         };

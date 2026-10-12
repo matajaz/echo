@@ -63,3 +63,28 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=131072
 #     stays the default; 12/10 are used explicitly where space is tight. ---
 CONFIG_LV_FONT_MONTSERRAT_10=y
 CONFIG_LV_FONT_MONTSERRAT_12=y
+
+# Main task runs app_main: board/display/ui/sensors/ha/audio init + the
+# readiness loop with logging. The 3584B IDF default overflowed (stack-
+# protection panic in the main task after UI init) once the feature set grew.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# Larger fonts for the Overview card design (big temp/power readings).
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+
+# Theme title/reading fonts (echo_theme.h).
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+
+# LVGL object pool: 32KB exhausted once every page builds its rows+cards
+# (store fault in lv_obj_class_create_obj = failed lv_malloc). 64KB internal RAM.
+
+# Use the ESP heap allocator (internal+PSRAM) for LVGL instead of a fixed
+# static pool — the fixed pool capped object count (store faults on the
+# card/list pages). PSRAM-backed, so object count is no longer the ceiling.
+
+# LVGL allocates from PSRAM (shim) — fixed internal pool chronically ran
+# full (lv_mem_buf_get hang under swipe+play). PSRAM frees internal RAM for WiFi.
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEM_CUSTOM_INCLUDE="lv_psram_alloc.h"

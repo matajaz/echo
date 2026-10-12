@@ -15,6 +15,29 @@ if(DEFINED ENV{IDF_PATH})
     include_directories("$ENV{IDF_PATH}/components/esp_driver_i2c/include")
 endif()
 
-set(PROJECT_VER "119")
+set(PROJECT_VER "151")
+
+# Route LVGL's custom allocator (CONFIG_LV_MEM_CUSTOM=y) to PSRAM via the shim
+# in main/lv_psram_alloc.{h,c}. These macros are NOT Kconfig options, so define
+# them globally here (before project()) so the lvgl component sees them; the
+# function declarations come from LV_MEM_CUSTOM_INCLUDE="lv_psram_alloc.h".
+add_compile_definitions(
+    "LV_MEM_CUSTOM_ALLOC=echo_lv_malloc"
+    "LV_MEM_CUSTOM_FREE=echo_lv_free"
+    "LV_MEM_CUSTOM_REALLOC=echo_lv_realloc"
+)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# Make EVERY component (including the managed lvgl) depend on lv_psram_alloc, so
+# lvgl both finds lv_psram_alloc.h (LV_MEM_CUSTOM_INCLUDE) and links the shim
+# symbols (echo_lv_malloc/free/realloc) referenced by the LV_MEM_CUSTOM_* macros.
+idf_build_set_property(__COMPONENT_REQUIRES_COMMON lv_psram_alloc APPEND)
+
 project(echo)
+
+# Fail the normal build when catalogue bindings drift from the source YAML.
+add_custom_target(check_entities ALL
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_entities.py" --check
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
+add_dependencies(${CMAKE_PROJECT_NAME}.elf check_entities)

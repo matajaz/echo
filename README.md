@@ -66,8 +66,23 @@ idf.py set-target esp32c5            # once (writes sdkconfig); already set in-r
 idf.py build                        # -> build/echo.bin
 ```
 
-There is **no host-test harness** in echo (no `test/`/`shared/` dir, unlike
-lumen) — a clean `idf.py build` is the verification bar here.
+Host tests cover the policies, HA/price/statistics parsing, WAV fragmentation,
+chart windows and touch gating. With managed dependencies resolved, run:
+
+```bash
+make -C core/test test
+python3 tools/test_audio_service.py
+python3 tools/test_gen_entities.py
+python3 tools/gen_entities.py --check
+python3 tools/preview_ui.py  # real LVGL render, nine-page clipping/interaction checks
+```
+
+The normal firmware build also checks catalogue bindings. The host preview
+needs CMake, a C compiler and Pillow. See
+[the v144 implementation notes](docs/REVIEW-IMPLEMENTATION-2026-10-12.md)
+for the page architecture, data contracts, hardware options and USB acceptance
+checks. Host tests do not prove speaker quality, RTC backup power or touch on
+physical hardware.
 
 ### Deploy over USB (always for the first flash of a new feature)
 
@@ -392,9 +407,9 @@ from an on-screen button, with volume up/down). Getting there took ~12
 failed attempts chasing the wrong causes, so the real root cause and the
 diagnostic method are documented here in detail.
 
-### Hardware wiring (verified against the vendor BSP, not guessed)
+### Hardware wiring (verified against the schematic)
 - Codec: **ES8311** on the shared I2C bus (`ES8311_CODEC_DEFAULT_ADDR`).
-- I2S: SCLK=GPIO24, WS/LRCK=GPIO25, DOUT=GPIO26, DSIN=GPIO27, **MCLK=NC**
+- I2S: SCLK=GPIO24, WS/LRCK=GPIO25, **ESP DOUT=GPIO27**, **ESP DIN=GPIO26**, **MCLK=NC**
   (not wired -- `use_mclk=false`, the ES8311 clocks off BCLK), I2S_NUM_0,
   master, **16-bit MONO** slot (the esp_codec_dev driver maps our
   `.channel=1` onto one active I2S slot -- do NOT switch to stereo; the
@@ -406,6 +421,35 @@ diagnostic method are documented here in detail.
 - The vendor's `08_bookesia` BSP full-duplex pattern is matched: the I2S
   channel is created with BOTH tx+rx handles and both are handed to
   `audio_codec_new_i2s_data`.
+
+The vendor example header's DOUT=26/DSIN=27 assignment contradicts the
+[board schematic](https://github.com/waveshareteam/ESP32-C5-Touch-LCD-2.8/blob/main/schematic/ESP32-C5-Touch-LCD-2.8.pdf).
+GPIO27 connects to ES8311 pin 9 **DSDIN** (DAC input); GPIO26 connects to
+pin 7 **ASDOUT** (ADC output). Firmware through v146 used the reversed
+ESP-side directions, so successful PCM writes did not prove audible output.
+v147 changes these directions; that change alone did not resolve silence.
+The saved factory image contains the older GPIO26/27 assignment, so the vendor
+materials disagree. The user confirmed audible output with GPIO27 as DOUT in
+v149, after fixing amplifier enable; retain this hardware-tested assignment.
+Audio diagnostics now cache live codec registers and PCM
+sample counts from the audio owner; HTTP readers no longer read the closed
+codec or contend with playback.
+
+### Silent melodies: amplifier enable (2026-10-12)
+
+In v148 the CH32 acknowledged PA output HIGH, but its input register stayed
+`0x03` while the output shadow was `0x0b`: LCD/touch reset were high and PA
+EXIO3 was low, both after settling and while PCM was queued. In v149, changing
+only EXIO3 to input and back to output changed readback to `0x0b`; the user
+confirmed sound. This rules out interpreting an acknowledged GPIO write or
+successful PCM write as proof of speaker output.
+
+`board_pa_enable()` now checks settled pin readback. If it differs from the
+requested level, it reapplies only the PA direction using that tested sequence,
+preserving all other pins, and verifies the result. A failed enable is reported
+to the audio service instead of silently playing. Idle/stop still disable the
+amplifier. The workaround is local to board services; managed vendor components
+are unchanged. The exact cause inside the pre-flashed CH32 firmware is unknown.
 
 ### The crackle: root cause was FOUR things, not one
 The "sparks/crackle" was NOT a single bug, which is why single-variable

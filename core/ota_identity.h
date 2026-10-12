@@ -69,9 +69,15 @@ static inline ota_accept_t ota_identity_accept(const ota_target_t *tgt,
     bool rebooted = saw_reboot || (rep->boot_id != 0u && rep->boot_id != baseline_boot_id);
     if (!rebooted) return OTA_WAIT;
 
-    // Identity: prefer sha (immutable), else project+version.
+    // Identity. N09: when require_sha is set, the digest is MANDATORY — missing
+    // or empty evidence (on either side) must fail closed (WAIT for valid
+    // evidence), never silently downgrade to a version-string match. Only when
+    // require_sha is NOT set do we use the legacy project+version comparison.
     bool identity_ok;
-    if (tgt->require_sha && tgt->app_sha[0] && rep->app_sha[0]) {
+    if (tgt->require_sha) {
+        if (!tgt->app_sha[0] || !rep->app_sha[0]) {
+            return OTA_WAIT;   // required digest but evidence missing -> fail closed
+        }
         identity_ok = (strncmp(tgt->app_sha, rep->app_sha, sizeof(tgt->app_sha)) == 0);
     } else {
         identity_ok = (strncmp(tgt->project, rep->project, sizeof(tgt->project)) == 0) &&

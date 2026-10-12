@@ -10,10 +10,20 @@ TARGET  := test_core
 SRC     := test_core.c
 
 .PHONY: test clean
-test: $(TARGET)
-	./$(TARGET)
+CJSON := ../../managed_components/espressif__cjson/cJSON
+REVIEW_DEPS := ../wav_stream.h ../chart_history.h ../input_gate.h ../ha_parse.h ../ha_model.h ../energy_model.h ../time_utils.h
 
-$(TARGET): $(SRC) ../sample_model.h ../readiness.h ../ota_identity.h ../audio_cmd.h
+test: $(TARGET) test_review
+	./$(TARGET)
+	./test_review
+
+cjson_test.o: $(CJSON)/cJSON.c
+	$(CC) $(CFLAGS) -Wno-deprecated-declarations -I$(CJSON) -c $< -o $@
+
+test_review: test_review.c ../ha_parse.c cjson_test.o $(REVIEW_DEPS) fixtures/nordpool.json fixtures/energy_statistics.json
+	$(CC) $(CFLAGS) -I$(CJSON) -o $@ test_review.c ../ha_parse.c cjson_test.o -lm
+
+$(TARGET): $(SRC) ../sample_model.h ../readiness.h ../ota_identity.h ../audio_cmd.h ../comfort_rules.h
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
 clean:
