@@ -85,6 +85,43 @@ class ProtocolTests(unittest.TestCase):
             self.assertNotIn('test-key',json.dumps(record))
             return record
 
+    @staticmethod
+    def _firmware_percent_decode(s):
+        # Faithful port of main/ota.c ota_percent_decode(): decode %XX in place,
+        # '+' stays literal (query/path convention, not form-body).
+        out = []
+        i = 0
+        hexd = '0123456789abcdefABCDEF'
+        while i < len(s):
+            if s[i] == '%' and i + 2 < len(s) and s[i+1] in hexd and s[i+2] in hexd:
+                out.append(chr(int(s[i+1:i+3], 16))); i += 3
+            else:
+                out.append(s[i]); i += 1
+        return ''.join(out)
+
+    def test_trigger_url_decodes_to_allowlist(self):
+        # Contract between tools/maintenance.py and the firmware /ota handler:
+        # the client percent-encodes the url (urlencode), the firmware decodes
+        # it, and the DECODED value must satisfy the OTA_URL_PREFIX allowlist.
+        # Regression guard for the bug where the handler compared the still-
+        # encoded value and 400'd ("missing/disallowed url") every deploy.
+        import urllib.parse
+        prefix = 'http://192.168.2.7:8091/echo/'
+        sha = hashlib.sha256(self.image()).hexdigest()
+        allowed = prefix + sha + '.bin'
+        # Exactly how maintenance.py puts it on the wire:
+        query = urllib.parse.urlencode({'key': 'k', 'url': allowed})
+        # The raw url token as the firmware's httpd_query_key_value() sees it
+        # (NOT pre-decoded): split on '&', find url=, keep it encoded.
+        raw = dict(p.split('=', 1) for p in query.split('&'))['url']
+        self.assertIn('%3A%2F%2F', raw)                       # it IS encoded on the wire
+        # Pre-fix firmware (no decode) would reject this:
+        self.assertFalse(raw.startswith(prefix))
+        # Post-fix firmware decodes, then the allowlist matches exactly:
+        decoded = self._firmware_percent_decode(raw)
+        self.assertEqual(decoded, allowed)
+        self.assertNotIn('%', decoded)
+
     def test_confirmed_deploy(self): self.assertEqual(self.run_deploy()['result'],'success')
     def test_trigger_rejection(self): self.assertEqual(self.run_deploy(reject=True)['result'],'failed')
     def test_wrong_image(self): self.assertEqual(self.run_deploy(matching=False)['result'],'failed')

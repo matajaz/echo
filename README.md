@@ -80,7 +80,17 @@ make -C core/test test
 python3 tools/test_audio_service.py
 python3 tools/test_gen_entities.py
 python3 tools/gen_entities.py --check
+python3 tools/test_maintenance.py  # OTA/log protocol + client<->firmware url contract
 python3 tools/preview_ui.py  # real LVGL render, nine-page clipping/interaction checks
+```
+
+End-to-end deploy smoke test (OPT-IN; needs a reachable board + firmware host).
+It publishes the built image and confirms the board reboots into the exact ELF
+identity -- the integration path the mocked unit tests cannot cover. With no
+`SMOKE_BOARD` set it prints `SKIP` and exits 0, so it is safe in host CI:
+
+```bash
+SMOKE_BOARD=192.168.2.198 python3 tools/smoke_deploy.py
 ```
 
 The normal firmware build also checks catalogue bindings. The host preview
