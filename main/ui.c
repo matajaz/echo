@@ -30,7 +30,7 @@ esp_err_t ui_init(void) {
         lvgl_port_remove_disp(disp); lvgl_port_deinit(); return ESP_ERR_NO_MEM;
     }
     s_initialized=true;
-    ESP_LOGI("ui","UI ready: 9 pages, touch=%d",input!=NULL); return ESP_OK;
+    ESP_LOGI("ui","UI ready: %d pages, touch=%d",UI_PAGE_COUNT,input!=NULL); return ESP_OK;
 }
 void ui_set_status(const char *text) {
     if (s_initialized && lvgl_port_lock(100)) { ui_shell_status(text); lvgl_port_unlock(); }

@@ -5,3 +5,5 @@ ha_result_t ha_parse_state(const char *json, const char *unit, float *value,
                           energy_prices_t *prices);
 bool ha_parse_statistics(const char *json, const char *import_id, const char *export_id,
                          energy_history_t *history);
+
+bool ha_parse_cost_statistics(const char *json,const char *cost_id,const char *income_id,energy_history_t *history);

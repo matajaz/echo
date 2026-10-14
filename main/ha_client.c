@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "secrets.h"
 #include "cJSON.h"
+#include "dashboard_lights.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -31,6 +32,11 @@ static uint32_t s_pause_gen, s_ack_gen;
 static int s_day_offset;
 static uint32_t s_history_request;
 static char *s_body;
+static dashboard_section_t *s_dashboard;
+static int s_light_command=-1;
+#ifndef ECHO_COLLECTOR_URL
+#define ECHO_COLLECTOR_URL "http://192.168.2.7:8091/extra.json"
+#endif
 typedef struct { char *buf; size_t len; bool overflow; } http_body_t;
 static void *json_alloc(size_t n) { return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT); }
 void ha_json_init(void) {
@@ -59,6 +65,7 @@ static void init_entries(ha_sensor_t *dest,const ha_entity_def_t *defs,int count
 }
 static unsigned cadence(const ha_sensor_t *s,int group) {
     if (s->role==HA_ROLE_PRICE) return 300000;
+    if (s->role==HA_ROLE_GRID_IMPORT_COST_TODAY || s->role==HA_ROLE_GRID_EXPORT_INCOME_TODAY) return 30000;
     return group==0 ? 10000 : group==1 ? 30000 : 300000;
 }
 static void fetch(esp_http_client_handle_t client,http_body_t *b,ha_sensor_t *entry) {
@@ -87,9 +94,49 @@ static void fetch(esp_http_client_handle_t client,http_body_t *b,ha_sensor_t *en
     if (result!=HA_VALID) ESP_LOGW(TAG,"%s: %s (http=%d bytes=%u)",entry->entity_id,
         ha_result_name(result),code,(unsigned)b->len);
 }
+static void dashboard_fetch(http_body_t *body,int source) {
+    char url[256];
+    if(source==0) snprintf(url,sizeof(url),"%s",ECHO_COLLECTOR_URL);
+    else snprintf(url,sizeof(url),"%s/api/states/%s",HA_BASE_URL,source==1?"sensor.vegena_panel":"sensor.vegena_ambient");
+    body->len=0;body->overflow=false;body->buf[0]=0;
+    esp_http_client_config_t cfg={.url=url,.timeout_ms=2500,.event_handler=http_event,.user_data=body,.disable_auto_redirect=true,.crt_bundle_attach=esp_crt_bundle_attach};
+    esp_http_client_handle_t client=esp_http_client_init(&cfg);if(!client)return;
+    // A separate client prevents the HA bearer token from reaching the collector.
+    if(source){char auth[sizeof(HA_TOKEN)+8];snprintf(auth,sizeof(auth),"Bearer %s",HA_TOKEN);esp_http_client_set_header(client,"Authorization",auth);}
+    esp_err_t err=esp_http_client_perform(client);int status=err==ESP_OK?esp_http_client_get_status_code(client):-1;
+    esp_http_client_cleanup(client);
+    if(status==200&&!body->overflow&&!paused()) {
+        xSemaphoreTake(s_mtx,portMAX_DELAY);dashboard_parse(body->buf,source,esp_timer_get_time(),s_dashboard);xSemaphoreGive(s_mtx);
+    }
+}
+bool ha_dashboard_get(int id,dashboard_section_t *out) {
+    if(!out||id<0||id>=DASH_COUNT||!__atomic_load_n(&s_started,__ATOMIC_ACQUIRE))return false;
+    if(xSemaphoreTake(s_mtx,pdMS_TO_TICKS(5))!=pdTRUE)return false;
+    *out=s_dashboard[id];xSemaphoreGive(s_mtx);return true;
+}
+bool ha_light_request(int index,bool on) {
+    if(index<0||index>=9||paused()||!__atomic_load_n(&s_started,__ATOMIC_ACQUIRE))return false;
+    dashboard_section_t snapshot;
+    if(!ha_dashboard_get(DASH_LIGHTS,&snapshot)||!dashboard_fresh(&snapshot,esp_timer_get_time(),time(NULL))||!(snapshot.available_lights&(1U<<index)))return false;
+    int empty=-1;return __atomic_compare_exchange_n(&s_light_command,&empty,index*2+(on?1:0),false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);
+}
+static void light_command(http_body_t *body) {
+    int command=__atomic_exchange_n(&s_light_command,-1,__ATOMIC_SEQ_CST);if(command<0||paused())return;
+    char url[256],payload[128],auth[sizeof(HA_TOKEN)+8];
+    snprintf(url,sizeof(url),"%s/api/services/light/%s",HA_BASE_URL,command%2?"turn_on":"turn_off");
+    snprintf(payload,sizeof(payload),"{\"entity_id\":\"%s\"}",dashboard_light_ids[command/2]);
+    snprintf(auth,sizeof(auth),"Bearer %s",HA_TOKEN);body->len=0;body->overflow=false;body->buf[0]=0;
+    esp_http_client_config_t cfg={.url=url,.method=HTTP_METHOD_POST,.timeout_ms=2500,.event_handler=http_event,.user_data=body,.disable_auto_redirect=true,.crt_bundle_attach=esp_crt_bundle_attach};
+    esp_http_client_handle_t c=esp_http_client_init(&cfg);if(!c)return;
+    esp_http_client_set_header(c,"Authorization",auth);esp_http_client_set_header(c,"Content-Type","application/json");esp_http_client_set_post_field(c,payload,strlen(payload));
+    esp_err_t err=esp_http_client_perform(c);int code=err==ESP_OK?esp_http_client_get_status_code(c):-1;esp_http_client_cleanup(c);
+    ESP_LOGI(TAG,"light command index=%d result=%d",command/2,code);
+    if(code==200||code==201)dashboard_fetch(body,1);
+}
 static void poll_task(void *arg) {
     (void)arg;
     http_body_t body={.buf=s_body};
+    uint64_t dashboard_due[3]={0};
     uint64_t last_history=0; uint32_t request_seen=UINT32_MAX;
     for (;;) {
         if (paused()) {
@@ -98,6 +145,7 @@ static void poll_task(void *arg) {
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
         }
+        if(!paused())light_command(&body);
         wifi_ap_record_t ap;
         bool wifi=esp_wifi_sta_get_ap_info(&ap)==ESP_OK;
         xSemaphoreTake(s_mtx,portMAX_DELAY); s_data.wifi_up=wifi; xSemaphoreGive(s_mtx);
@@ -130,6 +178,14 @@ static void poll_task(void *arg) {
                 esp_http_client_cleanup(client);
             }
         }
+        // One bounded bundle per owner loop; no additional network task/stack.
+        for(int source=0;source<3 && wifi && !paused();source++) {
+            uint64_t stamp=esp_timer_get_time();
+            uint64_t interval=source==2?300000000ULL:60000000ULL;
+            if(!dashboard_due[source] || stamp-dashboard_due[source]>=interval) {
+                dashboard_fetch(&body,source);dashboard_due[source]=stamp;break;
+            }
+        }
         uint64_t now=esp_timer_get_time();
         uint32_t request=__atomic_load_n(&s_history_request,__ATOMIC_ACQUIRE);
         if (!paused() && time(NULL)>1609459200 && (!last_history || request!=request_seen || now-last_history>=600000000ULL)) {
@@ -153,8 +209,10 @@ esp_err_t ha_init(void) {
     s_mtx=xSemaphoreCreateMutex();
     s_prices=json_alloc(sizeof(*s_prices)); s_price_stage=json_alloc(sizeof(*s_price_stage));
     s_body=json_alloc(HA_MAX_BODY);
-    if (!s_mtx || !s_prices || !s_price_stage || !s_body) {
-        free(s_prices); free(s_price_stage); free(s_body);
+    s_dashboard=json_alloc(sizeof(*s_dashboard)*DASH_COUNT);
+    if(s_dashboard)memset(s_dashboard,0,sizeof(*s_dashboard)*DASH_COUNT);
+    if (!s_mtx || !s_prices || !s_price_stage || !s_body || !s_dashboard) {
+        free(s_prices); free(s_price_stage); free(s_body); free(s_dashboard);
         if (s_mtx) vSemaphoreDelete(s_mtx);
         s_mtx=NULL; s_prices=s_price_stage=NULL; s_body=NULL;
         return ESP_ERR_NO_MEM;
@@ -166,8 +224,9 @@ esp_err_t ha_init(void) {
     init_entries(s_data.batteries,k_batt_entities,s_data.batt_count,900000);
     init_entries(s_data.power,k_power_entities,s_data.power_count,45000);
     for (int i=0;i<s_data.power_count;++i) if (s_data.power[i].role==HA_ROLE_PRICE) s_data.power[i].stale_ms=900000;
+    for (int i=0;i<s_data.power_count;++i) if (s_data.power[i].role==HA_ROLE_GRID_IMPORT_COST_TODAY || s_data.power[i].role==HA_ROLE_GRID_EXPORT_INCOME_TODAY) s_data.power[i].stale_ms=90000;
     if (xTaskCreate(poll_task,"ha_poll",6144,NULL,3,NULL)!=pdPASS) {
-        free(s_prices); free(s_price_stage); free(s_body); vSemaphoreDelete(s_mtx);
+        free(s_prices); free(s_price_stage); free(s_body); free(s_dashboard); vSemaphoreDelete(s_mtx);
         s_mtx=NULL; s_prices=s_price_stage=NULL; s_body=NULL;
         return ESP_ERR_NO_MEM;
     }

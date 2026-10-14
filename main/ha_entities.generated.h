@@ -34,5 +34,7 @@ static const ha_entity_def_t k_power_entities[] = {
     { "sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_production", "Exported", "kWh", HA_ROLE_GRID_EXPORT_TODAY },
     { "sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_consumption", "Imported", "kWh", HA_ROLE_GRID_IMPORT_TODAY },
     { "sensor.nordpool_kwh_se3_sek_3_10_025", "Price", "SEK/kWh", HA_ROLE_PRICE },
+    { "sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_consumption_cost", "Bought cost", "SEK", HA_ROLE_GRID_IMPORT_COST_TODAY },
+    { "sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_production_compensation", "Sold income", "SEK", HA_ROLE_GRID_EXPORT_INCOME_TODAY },
 };
 _Static_assert(sizeof(k_power_entities) / sizeof(k_power_entities[0]) <= HA_MAX_POWER, "power capacity");

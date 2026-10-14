@@ -21,6 +21,8 @@ typedef struct {
     int64_t start;
     float imported, exported;
     bool import_ok, export_ok;
+    float import_cost, export_income;
+    bool import_cost_ok, export_income_ok;
 } energy_hour_t;
 typedef struct {
     energy_hour_t hours[ENERGY_MAX_HOURS];

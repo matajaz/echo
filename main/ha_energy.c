@@ -62,11 +62,11 @@ static void cache(energy_history_t *h,bool write) {
     if (write) {
         uint64_t now=esp_timer_get_time();
         if (!last_write || now-last_write>=21600000000ULL) {
-            if (nvs_set_blob(n,"history_v1",h,sizeof(*h))==ESP_OK && nvs_commit(n)==ESP_OK) last_write=now;
+            if (nvs_set_blob(n,"history_v2",h,sizeof(*h))==ESP_OK && nvs_commit(n)==ESP_OK) last_write=now;
         }
     } else {
         energy_history_t saved; size_t size=sizeof(saved);
-        if (nvs_get_blob(n,"history_v1",&saved,&size)==ESP_OK && size==sizeof(saved) &&
+        if (nvs_get_blob(n,"history_v2",&saved,&size)==ESP_OK && size==sizeof(saved) &&
             saved.day_start==h->day_start && saved.day_end==h->day_end && saved.count==h->count && saved.ok) {
             *h=saved; h->cached=true; h->received_us=0;
             strlcpy(h->error,"Cached; HA unavailable",sizeof(h->error));
@@ -85,6 +85,7 @@ bool ha_energy_fetch(int day,energy_history_t *h,bool (*cancel)(void)) {
     if (h->count<1 || h->count>ENERGY_MAX_HOURS) { strlcpy(h->error,"Clock unavailable",sizeof(h->error)); return false; }
     for (int i=0;i<h->count;++i) h->hours[i].start=from+(int64_t)i*3600;
     const char *import_id=ha_role_entity(HA_ROLE_GRID_IMPORT_TODAY), *export_id=ha_role_entity(HA_ROLE_GRID_EXPORT_TODAY);
+    const char *cost_id=ha_role_entity(HA_ROLE_GRID_IMPORT_COST_TODAY),*income_id=ha_role_entity(HA_ROLE_GRID_EXPORT_INCOME_TODAY);
     if (!import_id || !export_id) { strlcpy(h->error,"Configure grid energy roles",sizeof(h->error)); return false; }
     char uri[256];
     const char *base=HA_BASE_URL;
@@ -107,7 +108,7 @@ bool ha_energy_fetch(int day,energy_history_t *h,bool (*cancel)(void)) {
     int bytes=snprintf(auth,sizeof(auth),"{\"type\":\"auth\",\"access_token\":\"%s\"}",HA_TOKEN);
     if (bytes<0 || (size_t)bytes>=sizeof(auth) || esp_websocket_client_send_text(client,auth,bytes,pdMS_TO_TICKS(1000))!=bytes) goto done;
     if (!receive(&reply,cancel) || !reply_type(reply.body,"auth_ok")) { error="HA history authentication failed"; goto done; }
-    struct tm utc; char a[32],b[32],query[512];
+    struct tm utc; char a[32],b[32],query[1024];
     gmtime_r(&from,&utc); strftime(a,sizeof(a),"%Y-%m-%dT%H:%M:%SZ",&utc);
     gmtime_r(&until,&utc); strftime(b,sizeof(b),"%Y-%m-%dT%H:%M:%SZ",&utc);
     bytes=snprintf(query,sizeof(query),"{\"id\":1,\"type\":\"recorder/statistics_during_period\","
@@ -115,7 +116,16 @@ bool ha_energy_fetch(int day,energy_history_t *h,bool (*cancel)(void)) {
         "\"period\":\"hour\",\"types\":[\"change\"],\"units\":{\"energy\":\"kWh\"}}",a,b,import_id,export_id);
     if (bytes<0 || (size_t)bytes>=sizeof(query) || esp_websocket_client_send_text(client,query,bytes,pdMS_TO_TICKS(1000))!=bytes) goto done;
     if (!receive(&reply,cancel)) { if (reply.failed) error="History response rejected"; goto done; }
-    h->ok=ha_parse_statistics(reply.body,import_id,export_id,h);
+    bool energy_ok=ha_parse_statistics(reply.body,import_id,export_id,h);
+    bool cost_ok=false;
+    if (cost_id && income_id && !cancel()) {
+        bytes=snprintf(query,sizeof(query),"{\"id\":2,\"type\":\"recorder/statistics_during_period\","
+            "\"start_time\":\"%s\",\"end_time\":\"%s\",\"statistic_ids\":[\"%s\",\"%s\"],"
+            "\"period\":\"hour\",\"types\":[\"change\"]}",a,b,cost_id,income_id);
+        if (bytes>0 && (size_t)bytes<sizeof(query) && esp_websocket_client_send_text(client,query,bytes,pdMS_TO_TICKS(1000))==bytes && receive(&reply,cancel))
+            cost_ok=ha_parse_cost_statistics(reply.body,cost_id,income_id,h);
+    }
+    h->ok=energy_ok || cost_ok;
     if (!h->ok) error="No recorded energy for this day";
 done:
     // The event context/buffer remain alive until the worker has fully stopped.

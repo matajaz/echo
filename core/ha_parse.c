@@ -45,14 +45,14 @@ done:
     cJSON_Delete(root); return result;
 }
 
-static bool statistics_series(const cJSON *result, const char *id, bool imported, energy_history_t *h) {
+static bool statistics_series(const cJSON *result, const char *id, int kind, energy_history_t *h) {
     const cJSON *array=field(result,id), *row;
     if (!cJSON_IsArray(array)) return false;
     bool any=false;
     cJSON_ArrayForEach(row,array) {
         const cJSON *start=field(row,"start"), *change=field(row,"change");
         if (!cJSON_IsNumber(start) || !cJSON_IsNumber(change) || !isfinite(change->valuedouble) ||
-            change->valuedouble < 0) continue;
+            (kind<2 && change->valuedouble < 0)) continue;
         double raw = start->valuedouble;
         // HA recorder returns epoch milliseconds; tolerate seconds for tests/older servers.
         if (raw > 1e11) raw /= 1000;
@@ -63,8 +63,10 @@ static bool statistics_series(const cJSON *result, const char *id, bool imported
         if (index < 0 || index >= h->count) continue;
         float v=(float)change->valuedouble;
         if (!isfinite(v)) continue;
-        if (imported) { h->hours[index].imported=v; h->hours[index].import_ok=true; }
-        else { h->hours[index].exported=v; h->hours[index].export_ok=true; }
+        if (kind==0) { h->hours[index].imported=v; h->hours[index].import_ok=true; }
+        else if (kind==1) { h->hours[index].exported=v; h->hours[index].export_ok=true; }
+        else if (kind==2) { h->hours[index].import_cost=v; h->hours[index].import_cost_ok=true; }
+        else { h->hours[index].export_income=v; h->hours[index].export_income_ok=true; }
         any=true;
     }
     return any;
@@ -74,9 +76,20 @@ bool ha_parse_statistics(const char *json, const char *import_id, const char *ex
     bool ok=false;
     if (!root || !cJSON_IsTrue(field(root,"success"))) goto done;
     const cJSON *result=field(root,"result");
-    bool from=statistics_series(result,import_id,true,h);
-    bool to=statistics_series(result,export_id,false,h);
+    bool from=statistics_series(result,import_id,0,h);
+    bool to=statistics_series(result,export_id,1,h);
     ok=from || to;
 done:
+    cJSON_Delete(root); return ok;
+}
+
+bool ha_parse_cost_statistics(const char *json,const char *cost_id,const char *income_id,energy_history_t *h) {
+    cJSON *root=cJSON_Parse(json); bool ok=false;
+    if (root && cJSON_IsTrue(field(root,"success"))) {
+        const cJSON *result=field(root,"result");
+        bool cost=cost_id && statistics_series(result,cost_id,2,h);
+        bool income=income_id && statistics_series(result,income_id,3,h);
+        ok=cost || income;
+    }
     cJSON_Delete(root); return ok;
 }

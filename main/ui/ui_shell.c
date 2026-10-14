@@ -22,7 +22,22 @@ static const ui_page_desc_t pages[UI_PAGE_COUNT]={
     [UI_BATTERIES]={"Batteries",ui_batteries_create,ui_batteries_update,NULL,NULL,NULL},
     [UI_MELODIES]={"Melodies",ui_melodies_create,ui_melodies_update,NULL,NULL,NULL},
     [UI_GRAPHS]={"Sensor graphs",ui_graphs_create,ui_graphs_update,NULL,NULL,ui_graphs_destroy},
-    [UI_INFO]={"Device info",ui_info_create,ui_info_update,NULL,NULL,NULL}
+    [UI_INFO]={"Device info",ui_info_create,ui_info_update,NULL,NULL,NULL},
+    [UI_COSTS]={"Energy costs",ui_costs_create,ui_costs_update,ui_costs_enter,NULL,NULL},
+    [UI_STATUS]={"Right now",ui_dash_status_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_WEATHER]={"Weather",ui_dash_weather_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_WEATHER_DAY]={"Weather today",ui_dash_weather_day_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_SUN]={"Sun & Moon",ui_dash_sun_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_NETWORK]={"Network",ui_dash_network_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_MARKETS]={"World / Markets",ui_dash_markets_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_AIR]={"Air quality",ui_dash_air_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_SERVICES]={"Network clients",ui_dash_services_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_NEWS]={"News",ui_dash_news_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_POLICE]={"Police events",ui_dash_police_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_TRANSIT]={"SL Transit",ui_dash_transit_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_LIGHTS]={"Lights",ui_dash_lights_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_HUMIDITY]={"Humidity",ui_dash_humidity_create,ui_dashboard_update,NULL,NULL,NULL},
+    [UI_POWER_HISTORY]={"Solar / grid history",ui_power_history_create,ui_power_history_update,NULL,NULL,NULL}
 };
 typedef struct {
     lv_obj_t *tileview,*tiles[UI_PAGE_COUNT],*title,*clock,*wifi,*battery,*index,*pin,*menu,*clean,*clean_text,*toast,*motion_button;
@@ -126,6 +141,7 @@ void ui_shell_status(const char *text) { ui_feedback(text); }
 static void update(lv_timer_t *timer) {
     (void)timer; uint64_t now=now_us(); s->model.now_us=now; s->model.wall_time=time(NULL);
     s->model.have_ha=ha_get(&s->model.ha); s->model.have_sensors=sensors_get(&s->model.sensors);
+    ui_power_history_record(&s->model);
     audio_get_status(&s->model.audio); s->model.clock_source=sensors_clock_source();
     bool th=s->model.have_sensors && sensors_group_fresh_at(s->model.sensors.th_last_us,now);
     comfort_rule_update(&rules[0],&s->comfort[0],th,s->model.sensors.humidity_rh,now/1000);
@@ -193,7 +209,7 @@ bool ui_shell_init(lv_indev_t *input) {
     lv_obj_t *nav=ui_row(screen,224,32,4); lv_obj_set_pos(nav,8,286);
     ui_button(nav,LV_SYMBOL_HOME,32,32,nav_button,(void *)UI_OVERVIEW);
     ui_button(nav,LV_SYMBOL_LEFT,28,32,nav_button,(void *)-1);
-    s->index=ui_label(nav,"1/9",ECHO_FONT_SMALL,ECHO_TEXT_DIM); lv_obj_set_size(s->index,36,32); lv_obj_set_style_text_align(s->index,LV_TEXT_ALIGN_CENTER,0);
+    s->index=ui_label(nav,"1/24",ECHO_FONT_SMALL,ECHO_TEXT_DIM); lv_obj_set_size(s->index,36,32); lv_obj_set_style_text_align(s->index,LV_TEXT_ALIGN_CENTER,0);
     ui_button(nav,LV_SYMBOL_RIGHT,28,32,nav_button,(void *)-2);
     ui_button(nav,"Menu",48,32,nav_button,(void *)-3);
     s->pin=ui_button(nav,"Pin",32,32,nav_button,(void *)-4);

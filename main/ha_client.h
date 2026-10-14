@@ -3,6 +3,8 @@
 #include "esp_err.h"
 #include "ha_model.h"
 #include "energy_model.h"
+#include "dashboard_model.h"
+bool ha_dashboard_get(int section,dashboard_section_t *out);
 typedef struct {
     ha_sensor_t sensors[HA_MAX_SENSORS], batteries[HA_MAX_BATT], power[HA_MAX_POWER];
     int count, batt_count, power_count;
@@ -24,3 +26,5 @@ int ha_batt_count(void);
 bool ha_sensor_meta(int index, ha_sensor_t *out);
 bool ha_poll_pause(unsigned timeout_ms);
 void ha_poll_resume(void);
+
+bool ha_light_request(int index,bool on);

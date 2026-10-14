@@ -77,3 +77,12 @@ power:
     name: Price
     role: price
     unit: SEK/kWh
+
+  - id: sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_consumption_cost
+    name: Bought cost
+    role: grid_import_cost_today
+    unit: SEK
+  - id: sensor.tibber_pulse_blomsterkungsvagen_416_accumulated_production_compensation
+    name: Sold income
+    role: grid_export_income_today
+    unit: SEK

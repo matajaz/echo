@@ -27,7 +27,7 @@ $(TARGET): $(SRC) ../sample_model.h ../readiness.h ../ota_identity.h ../audio_cm
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
 clean:
-	rm -rf $(TARGET) $(TARGET).dSYM test_review test_review.dSYM test_history_cache test_history_cache.dSYM cjson_test.o
+	rm -rf $(TARGET) $(TARGET).dSYM test_review test_review.dSYM test_history_cache test_history_cache.dSYM cjson_test.o test_dashboard test_dashboard.dSYM
 
 test_history_cache: test_history_cache.c ../history_cache.h ../chart_history.h
 	$(CC) $(CFLAGS) -o $@ test_history_cache.c -lm
@@ -36,3 +36,11 @@ test: history-cache
 history-cache: test_history_cache
 	./test_history_cache
 .PHONY: history-cache
+
+# Same bounded dashboard projection is built for both boards.
+test_dashboard: test_dashboard.c ../dashboard_model.c ../dashboard_model.h ../cost_model.h ../ha_parse.c cjson_test.o
+	$(CC) $(CFLAGS) -I.. -I$(CJSON) -o $@ test_dashboard.c ../dashboard_model.c ../ha_parse.c cjson_test.o -lm
+test: dashboard
+dashboard: test_dashboard
+	./test_dashboard
+.PHONY: dashboard

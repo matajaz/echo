@@ -26,10 +26,10 @@ CATALOGUE = ROOT / "catalogue" / "entities.yaml"
 HEADER = ROOT / "main" / "ha_entities.generated.h"
 FIXTURE = ROOT / "core" / "test" / "fixtures" / "ha_entities.json"
 
-MAX_PER_SECTION = {"temperature": 9, "battery": 8, "power": 6}
+MAX_PER_SECTION = {"temperature": 9, "battery": 8, "power": 8}
 ROLES = {r: "HA_ROLE_" + r.upper() for r in (
     "none", "outdoor", "indoor", "solar_power", "grid_power", "grid_export_power",
-    "grid_export_today", "grid_import_today", "price", "solar_today")}
+    "grid_export_today", "grid_import_today", "price", "solar_today", "grid_import_cost_today", "grid_export_income_today")}
 ROLE_SECTION = {"outdoor": "temperature", "indoor": "temperature",
                 **{r: "power" for r in ROLES if r not in ("none", "outdoor", "indoor")}}
 MAX_ID = 79
@@ -124,7 +124,7 @@ def validate(sections: dict[str, list[dict[str, str]]]) -> None:
             unit = it.get("unit", "C" if sect == "temperature" else "%")
             if sect != "power" and unit != ("C" if sect == "temperature" else "%"):
                 raise CatalogueError(f"{sect}: unit must be canonical")
-            expected = {"price": "SEK/kWh", "grid_import_today": "kWh", "grid_export_today": "kWh", "solar_today": "kWh"}.get(role, "W")
+            expected = {"price": "SEK/kWh", "grid_import_today": "kWh", "grid_export_today": "kWh", "solar_today": "kWh", "grid_import_cost_today": "SEK", "grid_export_income_today": "SEK"}.get(role, "W")
             if sect == "power" and unit != expected:
                 raise CatalogueError(f"{role}: expected unit {expected}")
             if any(c in name for c in ('"', '\\')):

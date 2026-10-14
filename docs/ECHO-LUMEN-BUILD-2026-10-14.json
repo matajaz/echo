@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-14",
+  "status": "built_not_deployed",
+  "validation": {
+    "echo_policy_checks": 50,
+    "echo_review_checks": 114,
+    "echo_history_cache": "passed",
+    "dashboard_cost_tests": "ASan/UBSan passed",
+    "lumen_checks": 1142,
+    "polling_rotation_tests": "ASan/UBSan passed, 1000 concurrent pause races",
+    "python_tests": 25,
+    "python_subtests": 5,
+    "generator_checks": 15
+  },
+  "projects": {
+    "echo": {
+      "head": "38af364e25fe3fb891853d17cc7afbc0160621a1",
+      "binary": "/Volumes/repo/esp/echo/build/echo.bin",
+      "immutable_artifact": "/private/tmp/echo-lumen-artifacts-2026-10-14/echo/9660632ce1bcb1c4223b91a7d4d3bb40484cb0a845078e9724f6662ab8117b40.bin",
+      "size": 1809184,
+      "sha256": "9660632ce1bcb1c4223b91a7d4d3bb40484cb0a845078e9724f6662ab8117b40",
+      "elf_sha256": "cff4ce77ad79c2b72ccc332aa01122cd2fdf754a5431a6c5201df97f4a18c442",
+      "version": "154",
+      "pages": 24,
+      "build_log": "/private/tmp/echo-cost-build.log"
+    },
+    "lumen": {
+      "head": "432b14021cc3812c50bb6bd13a74790c86314552",
+      "binary": "/private/tmp/lumen-echo-build/lumen.bin",
+      "immutable_artifact": "/private/tmp/echo-lumen-artifacts-2026-10-14/lumen/00ed7dc44ee6f7327a9bf2aedcf0e7affa50c0c3e2decb26c9eb3687c0898f5c.bin",
+      "size": 2102432,
+      "sha256": "00ed7dc44ee6f7327a9bf2aedcf0e7affa50c0c3e2decb26c9eb3687c0898f5c",
+      "elf_sha256": "2ff6c2f75f679156b9d7909715c36daad85d86218658adf9e31b93009bad2d91",
+      "version": "432b140-dirty",
+      "pages": 30,
+      "build_log": "/private/tmp/lumen-build.log"
+    }
+  }
+}

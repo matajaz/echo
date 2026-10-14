@@ -69,7 +69,7 @@ toomany = "version: 1\ntemperature:\n" + "".join(
     f"  - id: sensor.s{i}\n    name: S{i}\n" for i in range(10))
 expect_error("too many entries (>9)", toomany)
 
-for section, limit in (("battery", 8), ("power", 6)):
+for section, limit in (("battery", 8), ("power", 8)):
     items = f"version: 1\n{section}:\n" + "".join(
         f"  - id: sensor.s{i}\n    name: S{i}\n" for i in range(limit + 1))
     expect_error(f"{section} over capacity", items)
