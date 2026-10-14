@@ -15,7 +15,7 @@ if(DEFINED ENV{IDF_PATH})
     include_directories("$ENV{IDF_PATH}/components/esp_driver_i2c/include")
 endif()
 
-set(PROJECT_VER "151")
+set(PROJECT_VER "153")
 
 # Route LVGL's custom allocator (CONFIG_LV_MEM_CUSTOM=y) to PSRAM via the shim
 # in main/lv_psram_alloc.{h,c}. These macros are NOT Kconfig options, so define

@@ -114,7 +114,10 @@ static void mk_report(ota_report_t *r, const char *ver, const char *sha,
 static void test_ota_identity(void) {
     printf("ota_identity:\n");
     ota_target_t tgt; ota_report_t rep;
-    const char *shaA = "aaaa"; const char *shaB = "bbbb";
+    const char *shaA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; const char *shaB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    mk_target(&tgt,"75","aaaa",true); mk_report(&rep,"75","aaaa",IMG_VALID,2,true);
+    CHECK(ota_identity_accept(&tgt,&rep,1,false)==OTA_WAIT,"truncated identity cannot prove exact image");
 
     // exact sha + VALID + rebooted -> ACCEPT
     mk_target(&tgt, "75", shaA, true);

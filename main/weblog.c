@@ -12,6 +12,7 @@
 //   - the log response is built under the lock but send() happens OUTSIDE
 //     it (don't hold the ring mutex across a slow HTTP write).
 #include "weblog.h"
+#include "ota.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -30,6 +31,7 @@ typedef struct {
 } log_line_t;
 
 static log_line_t s_ring[RING_LINES];
+static uint32_t s_dropped,s_truncated;
 static uint32_t s_next_id = 1;   // id to assign to the NEXT stored line
 static int s_head = 0;           // index of the next slot to write
 static SemaphoreHandle_t s_lock = NULL;
@@ -65,6 +67,7 @@ static int weblog_vprintf(const char *fmt, va_list args) {
     char buf[WEBLOG_LINE_MAX];
     int n = vsnprintf(buf, sizeof(buf), fmt, args_copy);
     va_end(args_copy);
+    if (n >= (int)sizeof(buf)) __atomic_fetch_add(&s_truncated,1,__ATOMIC_RELAXED);
     if (n > 0 && s_lock != NULL) {
         // Strip a single trailing newline so each ring slot is one line.
         size_t len = strlen(buf);
@@ -74,7 +77,7 @@ static int weblog_vprintf(const char *fmt, va_list args) {
         if (xSemaphoreTake(s_lock, 0) == pdTRUE) {   // never block the logger
             ring_put(buf);
             xSemaphoreGive(s_lock);
-        }
+        } else __atomic_fetch_add(&s_dropped,1,__ATOMIC_RELAXED);
     }
     return ret;
 }
@@ -178,8 +181,8 @@ static esp_err_t handle_log_txt(httpd_req_t *req) {
     // send. Sending them separately would let a partial write deliver the
     // cursor while dropping the body, and the client would then resume past
     // lines it never received.
-    char header[32];
-    int hlen = snprintf(header, sizeof(header), "id: %u\n", (unsigned)cursor);
+    char header[64];
+    int hlen = snprintf(header, sizeof(header), "boot: %u\nid: %u\n", (unsigned)ota_boot_id(), (unsigned)cursor);
     if (hlen < 0) {
         hlen = 0;
     }
@@ -196,8 +199,8 @@ static esp_err_t handle_log_txt(httpd_req_t *req) {
         // one. With no prior ?since, send id 0 so it re-pulls a tail.
         free(body);
         uint32_t safe_cursor = (have_since && !stale_since) ? since : 0;
-        char safe_header[32];
-        int sl = snprintf(safe_header, sizeof(safe_header), "id: %u\n",
+        char safe_header[64];
+        int sl = snprintf(safe_header, sizeof(safe_header), "boot: %u\nid: %u\n", (unsigned)ota_boot_id(),
                           (unsigned)safe_cursor);
         httpd_resp_send(req, safe_header, (sl > 0) ? sl : 0);
         return ESP_OK;
@@ -357,4 +360,9 @@ esp_err_t weblog_register(httpd_handle_t server) {
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+void weblog_stats(uint32_t *dropped,uint32_t *truncated) {
+    *dropped=__atomic_load_n(&s_dropped,__ATOMIC_RELAXED);
+    *truncated=__atomic_load_n(&s_truncated,__ATOMIC_RELAXED);
 }

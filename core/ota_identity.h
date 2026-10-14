@@ -3,7 +3,7 @@
 // V09 root cause: version strings + reachability are NOT image identity, so a
 // same-version failed update can read as SUCCESS and a fast reboot can go
 // unconfirmed. This encodes the acceptance DECISION as a pure, host-testable
-// function the deploy client uses: a deploy is accepted ONLY when the running
+// policy; the Python deployment adapter enforces the same full-ELF contract: a deploy is accepted ONLY when the running
 // image's identity matches the expected target AND it is confirmed VALID.
 //
 // The device exports its real identity (running ELF/app sha, project, version,
@@ -33,7 +33,7 @@ typedef enum {
 typedef struct {
     char     project[16];  // e.g. "echo"
     char     version[16];  // PROJECT_VER string
-    char     app_sha[65];  // hex sha256 of the published .bin (immutable name)
+    char     app_sha[65];  // hex SHA-256 of the application ELF (esp_app_desc_t)
     bool     require_sha;  // if false, fall back to version match (legacy)
 } ota_target_t;
 
@@ -55,9 +55,14 @@ typedef enum {
     OTA_REJECT_UNCONFIRMED,  // right image but still PENDING/UNKNOWN past the window
 } ota_accept_t;
 
+static inline bool ota_digest_valid(const char digest[65]) {
+    for (int i=0;i<64;i++) if (!((digest[i]>='0' && digest[i]<='9') || (digest[i]>='a' && digest[i]<='f'))) return false;
+    return digest[64]=='\0';
+}
+
 // Decide acceptance. `baseline_boot_id` is the device's boot_id BEFORE the
 // trigger; `saw_reboot` is set by the client when it observed a reboot
-// (uptime reset / unreachable / boot_id change). Pure.
+// (uptime reset / boot_id change; reachability loss is not proof). Pure.
 static inline ota_accept_t ota_identity_accept(const ota_target_t *tgt,
                                                const ota_report_t *rep,
                                                uint32_t baseline_boot_id,
@@ -75,7 +80,7 @@ static inline ota_accept_t ota_identity_accept(const ota_target_t *tgt,
     // require_sha is NOT set do we use the legacy project+version comparison.
     bool identity_ok;
     if (tgt->require_sha) {
-        if (!tgt->app_sha[0] || !rep->app_sha[0]) {
+        if (!ota_digest_valid(tgt->app_sha) || !ota_digest_valid(rep->app_sha)) {
             return OTA_WAIT;   // required digest but evidence missing -> fail closed
         }
         identity_ok = (strncmp(tgt->app_sha, rep->app_sha, sizeof(tgt->app_sha)) == 0);

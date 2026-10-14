@@ -1,6 +1,10 @@
 #include "ui_graphs.h"
 #include "ui/ui_widgets.h"
 #include "chart_history.h"
+#include "history_cache.h"
+#include "ota.h"
+#include "nvs.h"
+#include <time.h>
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include <math.h>
@@ -22,8 +26,41 @@ typedef struct {
     chart_history_t history[METRIC_COUNT][RANGE_COUNT];
     int selected,range;
     uint64_t last_draw,started;
-    bool dirty;
+    bool dirty,restored;
+    uint64_t last_save;
+    uint32_t save_failures;
 } graphs_t;
+static uint64_t history_slot(int range,uint64_t now,time_t wall) {
+    if (range!=RANGE_COUNT-1) return now/periods[range];
+    return wall>1609459200?(uint64_t)wall/(periods[range]/1000000):0;
+}
+static void history_store(graphs_t *s,bool write,uint64_t slot) {
+    if (!slot) return;
+    history_cache_t *b=heap_caps_calloc(1,sizeof(*b),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if (!b) { if (write) s->save_failures++; return; }
+    nvs_handle_t n;
+    if (nvs_open("echo_graphs",write?NVS_READWRITE:NVS_READONLY,&n)!=ESP_OK) { if (write) s->save_failures++; free(b); return; }
+    if (write) {
+        b->magic=HISTORY_CACHE_MAGIC; b->version=1;
+        for (int m=0;m<METRIC_COUNT;m++) for (int i=0;i<CHART_HISTORY_POINTS;i++) {
+            const chart_bucket_t *v=&s->history[m][RANGE_COUNT-1].buckets[i];
+            if (!v->count || !v->slot || v->slot-1>slot || slot-(v->slot-1)>=CHART_HISTORY_POINTS) continue;
+            b->records[m][i]=(history_record_t){.slot=v->slot,.count=v->count,.average=v->sum/v->count,.min=v->min,.max=v->max};
+        }
+        b->crc=history_crc(b,offsetof(history_cache_t,crc));
+        if (nvs_set_blob(n,"day_v1",b,sizeof(*b))!=ESP_OK || nvs_commit(n)!=ESP_OK) s->save_failures++;
+    } else {
+        size_t length=sizeof(*b);
+        if (nvs_get_blob(n,"day_v1",b,&length)==ESP_OK && length==sizeof(*b) && history_cache_valid(b,slot)) {
+            for (int m=0;m<METRIC_COUNT;m++) for (int i=0;i<CHART_HISTORY_POINTS;i++) {
+                const history_record_t *v=&b->records[m][i];
+                if (!v->count || slot-(v->slot-1)>=CHART_HISTORY_POINTS) continue;
+                s->history[m][RANGE_COUNT-1].buckets[i]=(chart_bucket_t){.slot=v->slot,.count=v->count,.sum=(double)v->average*v->count,.min=v->min,.max=v->max};
+            }
+        }
+    }
+    nvs_close(n); free(b);
+}
 static bool values(const sensors_data_t *s,uint64_t now,float out[METRIC_COUNT],bool valid[METRIC_COUNT]) {
     bool th=sensors_group_fresh_at(s->th_last_us,now),imu=sensors_group_fresh_at(s->imu_last_us,now);
     valid[0]=valid[1]=th; valid[2]=valid[3]=imu; valid[4]=s->bat_ok&&sensors_group_fresh_at(s->bat_last_us,now);
@@ -34,11 +71,18 @@ static bool values(const sensors_data_t *s,uint64_t now,float out[METRIC_COUNT],
 }
 static void collect(lv_timer_t *timer) {
     graphs_t *s=timer->user_data; sensors_data_t data;
-    if (!sensors_get(&data)) return;
-    float v[METRIC_COUNT]; bool valid[METRIC_COUNT]; uint64_t now=esp_timer_get_time();
-    values(&data,now,v,valid);
-    for (int i=0;i<METRIC_COUNT;++i) if (valid[i]) for (int range=0;range<RANGE_COUNT;++range)
-        chart_history_add(&s->history[i][range],now/periods[range],v[i]);
+    uint64_t now=esp_timer_get_time(); time_t wall=time(NULL); uint64_t long_slot=history_slot(RANGE_COUNT-1,now,wall);
+    if (!s->restored && long_slot) { history_store(s,false,long_slot); s->restored=true; s->last_save=now; }
+    float v[METRIC_COUNT]; bool valid[METRIC_COUNT];
+    if (sensors_get(&data)) {
+        values(&data,now,v,valid);
+        for (int i=0;i<METRIC_COUNT;i++) if (valid[i]) for (int range=0;range<RANGE_COUNT;range++) {
+            uint64_t slot=history_slot(range,now,wall);
+            if (range!=RANGE_COUNT-1 || slot) chart_history_add(&s->history[i][range],slot,v[i]);
+        }
+    }
+    ota_debug_t ota; ota_debug_get(&ota);
+    if (s->restored && now-s->last_save>=900000000ULL && !ota.in_progress) { history_store(s,true,long_slot); s->last_save=now; }
 }
 static void metric_changed(lv_event_t *e) {
     graphs_t *s=lv_event_get_user_data(e); s->selected=lv_dropdown_get_selected(s->metric); s->dirty=true;
@@ -78,7 +122,7 @@ void ui_graphs_update(void *state,const ui_model_t *m) {
     ui_text(s->current,text);
     lv_obj_set_style_text_color(s->current,lv_color_hex(valid[s->selected]?colors[s->selected]:ECHO_TEXT_DIM),0);
     if (s->dirty || m->now_us-s->last_draw>=2000000) {
-        uint64_t slot=m->now_us/periods[s->range]; chart_history_t *h=&s->history[s->selected][s->range];
+        uint64_t slot=history_slot(s->range,m->now_us,m->wall_time); chart_history_t *h=&s->history[s->selected][s->range];
         chart_stats_t stats=chart_history_stats(h,slot);
         float lo=stats.valid?stats.min:0,hi=stats.valid?stats.max:1;
         if (hi-lo<1) { lo-=.5f; hi+=.5f; }
@@ -97,7 +141,7 @@ void ui_graphs_update(void *state,const ui_model_t *m) {
         else snprintf(text,sizeof(text),"Min -- / Max -- / Avg --");
         ui_text(s->stats,text);
         uint64_t window=periods[s->range]*CHART_HISTORY_POINTS;
-        ui_text(s->history_note,m->now_us-s->started<window?"Partial history since boot":"Selected window / missing = gaps");
+        ui_text(s->history_note,s->save_failures?"History save failed":s->range==RANGE_COUNT-1?"Retained history / missing = gaps":m->now_us-s->started<window?"Partial history since boot":"Selected window / missing = gaps");
         for (int i=0;i<RANGE_COUNT;++i) ui_button_accent(s->ranges[i],i==s->range?ECHO_ACTION:ECHO_BUTTON);
         s->last_draw=m->now_us; s->dirty=false;
     }

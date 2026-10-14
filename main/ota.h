@@ -15,8 +15,13 @@ typedef struct {
     bool in_progress;        // an OTA is running right now
     unsigned attempt_count;  // how many triggers accepted since boot
     int64_t last_start_us;   // esp_timer_get_time() when the last attempt began (0 = never)
+    uint32_t bytes, total;
+    int64_t last_end_us;
+    const char *phase;
     const char *last_result; // "running" / "ok (rebooting)" / "http connect" / "read fail" / ...
 } ota_debug_t;
 
 // Copy the current OTA debug snapshot into *out. Safe from any task.
 void ota_debug_get(ota_debug_t *out);
+
+uint32_t ota_boot_id(void);

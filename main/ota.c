@@ -41,8 +41,13 @@
 #include "ota.h"
 #include "ha_client.h"
 #include "audio.h"
+#include "maintenance_api.h"
+#include "psa/crypto.h"
 
 static const char *TAG = "echo_ota";
+static uint32_t s_boot_id;
+static bool s_supervisor_ready;
+uint32_t ota_boot_id(void) { return s_boot_id; }
 
 static volatile bool s_ota_in_progress = false;
 // Monotonic start time (esp_timer_get_time) of the in-flight OTA, used by the
@@ -80,13 +85,22 @@ static void ota_dbg_mark_running(int64_t start_us) {
     s_ota_dbg.last_start_us = start_us;
     s_ota_dbg.in_progress = true;
     s_ota_dbg.last_result = "running";
+    s_ota_dbg.phase="queued"; s_ota_dbg.bytes=s_ota_dbg.total=0; s_ota_dbg.last_end_us=0;
     portEXIT_CRITICAL(&s_ota_dbg_mux);
 }
 
 static void ota_dbg_set_result(const char *r) {
     portENTER_CRITICAL(&s_ota_dbg_mux);
     s_ota_dbg.last_result = r;
+    s_ota_dbg.phase=!strcmp(r,"ok (rebooting)")?"rebooting":"failed";
+    s_ota_dbg.last_end_us=esp_timer_get_time();
     s_ota_dbg.in_progress = false;
+    portEXIT_CRITICAL(&s_ota_dbg_mux);
+}
+
+static void ota_dbg_progress(const char *phase,uint32_t bytes,uint32_t total) {
+    portENTER_CRITICAL(&s_ota_dbg_mux);
+    s_ota_dbg.phase=phase; s_ota_dbg.bytes=bytes; s_ota_dbg.total=total;
     portEXIT_CRITICAL(&s_ota_dbg_mux);
 }
 
@@ -282,12 +296,11 @@ static void ota_task(void *pvParameter) {
     // we ALWAYS ha_poll_resume() on every non-reboot exit below. V10: the
     // generation-tagged ack means a true return proves THIS pause quiesced the
     // poll task; log (don't silently ignore) a failure so a contended transfer
-    // is diagnosable. We still proceed — the OTA is the recovery path and must
-    // not be abandoned over a best-effort quiesce (the pause stays set and the
-    // poll task parks as soon as it next checks).
+    // is diagnosable. Abort unless the current pause generation is acknowledged.
+    ota_dbg_progress("pausing",0,0);
     if (!ha_poll_pause(5000)) {
-        ESP_LOGW(TAG, "HA polling did not quiesce within 5s before OTA — proceeding "
-                      "(pause remains set; transfer may briefly contend)");
+        ota_dbg_set_result("poll pause timeout"); ha_poll_resume(); free(url);
+        ota_busy_end(); vTaskDelete(NULL); return;
     }
 
     // STREAMING OTA WORKER — frees the HTTP transport BEFORE verify.
@@ -301,6 +314,7 @@ static void ota_task(void *pvParameter) {
     // client (release transport RAM) BEFORE esp_ota_end(). No LVGL/I2S teardown
     // needed. (This is why the earlier advanced-API attempt helped nothing — it
     // still verified with transport resident; the ordering is the whole point.)
+    ota_dbg_progress("connecting",0,0);
     esp_http_client_handle_t client = esp_http_client_init(&http_config);
     esp_err_t ret = client ? ESP_OK : ESP_ERR_NO_MEM;
     esp_ota_handle_t ota = 0;
@@ -324,7 +338,12 @@ static void ota_task(void *pvParameter) {
     // buffer is small so the transfer footprint stays low.
     static char rxbuf[1536];
     int total = 0;
+    ota_dbg_progress("downloading",0,clen>0?clen:0);
+    psa_hash_operation_t digest=PSA_HASH_OPERATION_INIT;
+    if (ret==ESP_OK && psa_hash_setup(&digest,PSA_ALG_SHA_256)!=PSA_SUCCESS) ret=ESP_FAIL;
+    int64_t last_progress=esp_timer_get_time();
     while (ret == ESP_OK) {
+        if (esp_timer_get_time()-last_progress>30000000LL || esp_timer_get_time()-__atomic_load_n(&s_ota_start_us,__ATOMIC_ACQUIRE)>OTA_TRANSFER_DEADLINE_US) { ret=ESP_ERR_TIMEOUT; break; }
         int n = esp_http_client_read(client, rxbuf, sizeof(rxbuf));
         if (n < 0) { ret = ESP_FAIL; break; }
         if (n == 0) {  // EOF (or no more data)
@@ -334,7 +353,9 @@ static void ota_task(void *pvParameter) {
             break;
         }
         ret = esp_ota_write(ota, rxbuf, n);
-        total += n;
+        if (psa_hash_update(&digest,(const uint8_t*)rxbuf,n)!=PSA_SUCCESS) ret=ESP_FAIL;
+        total += n; last_progress=esp_timer_get_time();
+        ota_dbg_progress("downloading",total,clen>0?clen:0);
     }
     bool complete = (ret == ESP_OK) && esp_http_client_is_complete_data_received(client);
     ESP_LOGI(TAG, "OTA download: wrote=%d declared=%lld complete=%d", total, (long long)clen, complete);
@@ -346,11 +367,22 @@ static void ota_task(void *pvParameter) {
 
     // CLOSE + FREE THE TRANSPORT NOW — before verify. This is the fix.
     if (client) { esp_http_client_close(client); esp_http_client_cleanup(client); client = NULL; }
+    uint8_t hash[32]; size_t hash_len=0; char hash_hex[65];
+    if (ret==ESP_OK && psa_hash_finish(&digest,hash,sizeof(hash),&hash_len)!=PSA_SUCCESS) ret=ESP_FAIL;
+    psa_hash_abort(&digest);
+    const char *file=strrchr(url,'/'); file=file?file+1:url;
+    bool pinned=strlen(file)==68 && !strcmp(file+64,".bin");
+    for (int i=0;pinned && i<64;i++) pinned=(file[i]>='0'&&file[i]<='9')||(file[i]>='a'&&file[i]<='f');
+    if (ret==ESP_OK && pinned) {
+        for (int i=0;i<32;i++) snprintf(hash_hex+i*2,3,"%02x",hash[i]);
+        if (strncmp(hash_hex,file,64)) ret=ESP_ERR_INVALID_CRC;
+    }
     free(url);
 
     if (ret == ESP_OK && complete && ota_begun) {
         // esp_ota_end() verifies the written image — now with transport RAM
         // released, so the verify has the headroom it lacked before.
+        ota_dbg_progress("verifying",total,clen>0?clen:0);
         ret = esp_ota_end(ota);        // consumes the handle
         ota_begun = false;
         if (ret == ESP_OK) ret = esp_ota_set_boot_partition(target);
@@ -429,6 +461,8 @@ static esp_err_t handle_ota(httpd_req_t *req) {
         !ota_key_matches(key, sizeof(key))) {
         return ota_send_error(req, "401 Unauthorized", "bad key");
     }
+
+    if (!s_supervisor_ready) return ota_send_error(req,"503 Service Unavailable","OTA supervisor unavailable");
 
     // Claim the OTA slot atomically. A plain "if (busy) reject; busy = true;"
     // lets two HTTP workers pass the check before either sets the flag, and
@@ -570,7 +604,7 @@ static esp_err_t handle_info(httpd_req_t *req) {
     // 8 bytes hex), its A/B image state, and a per-boot id so the deploy client
     // can prove the EXACT image is running + confirmed (not just a version
     // string, and catching a reboot that happened entirely between polls).
-    char sha_hex[17] = "";
+    char sha_hex[65] = "";
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t img_st = ESP_OTA_IMG_UNDEFINED;
     const char *state_str = "unknown";
@@ -585,13 +619,12 @@ static esp_err_t handle_info(httpd_req_t *req) {
         }
     }
     // app_desc->app_elf_sha256 is the 32-byte elf sha; format first 8 bytes.
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 32; i++) {
         snprintf(sha_hex + i * 2, 3, "%02x", app_desc->app_elf_sha256[i]);
     }
     // Stable per-boot id (random once at first /info; good enough to detect a
     // reboot across polls — a fresh boot re-randomizes it).
-    static uint32_t s_boot_id = 0;
-    if (s_boot_id == 0) s_boot_id = esp_random() | 1u;
+
 
     // Last reset reason (device-info + debugging an unexpected reboot).
     const char *rr;
@@ -615,12 +648,12 @@ static esp_err_t handle_info(httpd_req_t *req) {
     audio_diag(&a_ready, &a_codec, &a_vol, &a_muted, &a_err);
 
     audio_path_diag_t path; audio_get_path_diag(&path);
-    char buf[1024];
+    char buf[1536];
     snprintf(buf, sizeof(buf),
         "{\"fw\":\"%s\",\"idf\":\"%s\",\"ota_in_progress\":%s,"
         "\"rssi\":%d,\"heap_free\":%u,\"heap_min\":%u,\"uptime_s\":%llu,"
         "\"dma_free\":%u,\"dma_largest\":%u,\"int_free\":%u,\"int_largest\":%u,"
-        "\"app_sha\":\"%s\",\"img_state\":\"%s\",\"boot_id\":%u,"
+        "\"project\":\"echo\",\"app_sha_kind\":\"elf_sha256\",\"app_sha\":\"%s\",\"img_state\":\"%s\",\"boot_id\":%u,"
         "\"reset_reason\":\"%s\","
         "\"audio_ready\":%s,\"audio_codec\":%s,\"audio_vol\":%d,"
         "\"audio_muted\":%s,\"audio_err\":%d,"
@@ -643,6 +676,8 @@ static esp_err_t handle_info(httpd_req_t *req) {
 }
 
 httpd_handle_t ota_server_start(void) {
+    ha_json_init();
+    if (!s_boot_id) s_boot_id=esp_random()|1u;
     // Fail closed if the HTTP and HTTPS allowlist prefixes don't share the
     // same host (see ota_prefixes_share_host). Without this, a misconfigured
     // OTA_URL_PREFIX_HTTPS would be silently allowlisted and handed to
@@ -653,7 +688,7 @@ httpd_handle_t ota_server_start(void) {
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;  // + /play (WAV stream)
+    config.max_uri_handlers = 24;  // + /play (WAV stream)
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -674,6 +709,8 @@ httpd_handle_t ota_server_start(void) {
         .handler = handle_info,
     };
     httpd_register_uri_handler(server, &info_uri);
+    info_uri.uri="/api/v1/info"; httpd_register_uri_handler(server, &info_uri);
+    if (maintenance_api_register(server)!=ESP_OK) { httpd_stop(server); return NULL; }
 
     httpd_uri_t reboot_uri = {
         .uri = "/reboot",
@@ -699,7 +736,7 @@ httpd_handle_t ota_server_start(void) {
     };
     esp_timer_handle_t sup = NULL;
     if (esp_timer_create(&sup_args, &sup) == ESP_OK) {
-        esp_timer_start_periodic(sup, OTA_SUPERVISOR_PERIOD_US);
+        s_supervisor_ready=esp_timer_start_periodic(sup, OTA_SUPERVISOR_PERIOD_US)==ESP_OK;
     } else {
         ESP_LOGW(TAG, "OTA supervisor timer not created -- transfer hang guard disabled");
     }

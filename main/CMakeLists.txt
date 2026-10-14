@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.c" "ota.c" "display.c" "touch.c" "weblog.c" "ui.c" "ui_graphs.c" "sensors.c" "audio.c" "ha_client.c" "board_services.c" "echo_sun_20.c" "../core/ha_parse.c" "ha_energy.c"
+    SRCS "app_main.c" "ota.c" "maintenance_api.c" "display.c" "touch.c" "weblog.c" "ui.c" "ui_graphs.c" "sensors.c" "audio.c" "ha_client.c" "board_services.c" "echo_sun_20.c" "../core/ha_parse.c" "ha_energy.c"
         "ui/ui_shell.c" "ui/ui_widgets.c"
         "ui/pages/overview.c" "ui/pages/energy_now.c" "ui/pages/energy_today.c"
         "ui/pages/energy_prices.c" "ui/pages/temperatures.c" "ui/pages/batteries.c"

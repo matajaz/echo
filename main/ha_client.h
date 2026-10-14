@@ -10,6 +10,7 @@ typedef struct {
     int last_http_code;
     uint64_t last_response_us;
 } ha_data_t;
+void ha_json_init(void);
 esp_err_t ha_init(void);
 bool ha_get(ha_data_t *out);
 bool ha_prices_get(energy_prices_t *out);

@@ -13,3 +13,11 @@ deploy-log.jsonl
 core/test/test_review
 core/test/test_review.dSYM/
 core/test/cjson_test.o
+
+# Regenerable host-test outputs.
+core/test/test_core
+core/test/test_core.dSYM/
+core/test/test_history_cache
+core/test/test_history_cache.dSYM/
+__pycache__/
+*.pyc

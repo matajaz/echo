@@ -7,6 +7,8 @@
 #include "display.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "nvs.h"
+#include "ota.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +34,8 @@ typedef struct {
     ui_page_id_t active;
     uint64_t activity,clean_until,countdown_until,toast_until;
     bool dimmed,pinned,countdown_fired,pickup_wake;
+    int backlight_override,saved_page;
+    uint64_t page_changed;
     uint32_t motion_seq;
     comfort_rt_t comfort[2];
 } shell_t;
@@ -40,8 +44,21 @@ static const comfort_rule_t rules[]={
     {"Board temperature low",COMFORT_BELOW,15,17,600000}
 };
 static shell_t *s;
+static portMUX_TYPE status_mux=portMUX_INITIALIZER_UNLOCKED;
+static ui_status_t status;
+void ui_shell_snapshot(ui_status_t *out) {
+    portENTER_CRITICAL(&status_mux); *out=status; portEXIT_CRITICAL(&status_mux);
+}
+const char *ui_shell_page_name(int page) { return page>=0 && page<UI_PAGE_COUNT?pages[page].title:"Unavailable"; }
+static void publish_status(uint64_t now) {
+    ui_status_t next={.ready=true,.dimmed=s->dimmed,.pinned=s->pinned,.page=s->active,
+        .manual_backlight=s->backlight_override>=0,.backlight=s->backlight_override>=0?s->backlight_override:s->dimmed?10:100,
+        .idle_ms=(now-s->activity)/1000};
+    portENTER_CRITICAL(&status_mux); status=next; portEXIT_CRITICAL(&status_mux);
+}
+
 static uint64_t now_us(void) { return esp_timer_get_time(); }
-static void dim(bool on) { if (s->dimmed==on) return; if (display_set_backlight(on?10:100)==ESP_OK) s->dimmed=on; }
+static void dim(bool on) { if (s->dimmed==on) return; if (display_set_backlight(s->backlight_override>=0?s->backlight_override:on?10:100)==ESP_OK) s->dimmed=on; }
 static void touch_read(lv_indev_drv_t *driver,lv_indev_data_t *data) {
     s->raw_read(driver,data);
     bool pressed=data->state==LV_INDEV_STATE_PR;
@@ -58,6 +75,7 @@ static void navigation_changed(lv_event_t *event) {
     for (int i=0;i<UI_PAGE_COUNT;++i) if (tile==s->tiles[i]) {
         ui_page_id_t previous=s->active;
         if (previous!=i && pages[previous].leave && s->states[previous]) pages[previous].leave(s->states[previous]);
+        if (previous!=i) s->page_changed=now_us();
         s->active=i; ui_text(s->title,pages[i].title);
         char text[16]; snprintf(text,sizeof(text),"%d/%d",i+1,UI_PAGE_COUNT); ui_text(s->index,text);
         if (previous!=i && pages[i].enter && s->states[i]) pages[i].enter(s->states[i]);
@@ -66,7 +84,7 @@ static void navigation_changed(lv_event_t *event) {
 }
 void ui_navigate(ui_page_id_t page) {
     if (!s || page<0 || page>=UI_PAGE_COUNT) return;
-    s->activity=now_us(); lv_obj_set_tile(s->tileview,s->tiles[page],LV_ANIM_OFF);
+    s->activity=now_us(); dim(false); lv_obj_set_tile(s->tileview,s->tiles[page],LV_ANIM_OFF);
     lv_obj_add_flag(s->menu,LV_OBJ_FLAG_HIDDEN); navigation_changed(NULL);
 }
 static void nav_button(lv_event_t *event) {
@@ -147,9 +165,20 @@ static void update(lv_timer_t *timer) {
     }
     if (s->toast_until && now>=s->toast_until) { s->toast_until=0; lv_obj_add_flag(s->toast,LV_OBJ_FLAG_HIDDEN); }
     if (s->states[s->active]) pages[s->active].update(s->states[s->active],&s->model);
+    ota_debug_t ota; ota_debug_get(&ota);
+    if (s->active!=s->saved_page && now-s->page_changed>=5000000 && !ota.in_progress) {
+        nvs_handle_t n;
+        if (nvs_open("echo_ui",NVS_READWRITE,&n)==ESP_OK) {
+            if (nvs_set_i32(n,"page",s->active)==ESP_OK && nvs_commit(n)==ESP_OK) s->saved_page=s->active;
+            nvs_close(n);
+        }
+        s->page_changed=now;
+    }
+    publish_status(now);
 }
 bool ui_shell_init(lv_indev_t *input) {
     s=lv_mem_alloc(sizeof(*s)); if (!s) return false; memset(s,0,sizeof(*s));
+    s->backlight_override=-1; s->saved_page=-1;
     s->activity=now_us(); ui_theme_init(); lv_obj_t *screen=lv_scr_act();
     lv_obj_set_style_bg_color(screen,lv_color_hex(ECHO_BG),0); lv_obj_clear_flag(screen,LV_OBJ_FLAG_SCROLLABLE);
     ui_header_t header=ui_header(screen,"Overview");
@@ -182,6 +211,21 @@ bool ui_shell_init(lv_indev_t *input) {
     lv_obj_set_style_bg_color(s->toast,lv_color_hex(ECHO_CARD),0); lv_obj_set_style_bg_opa(s->toast,LV_OPA_COVER,0);
     lv_obj_align(s->toast,LV_ALIGN_BOTTOM_MID,0,-36); lv_obj_add_flag(s->toast,LV_OBJ_FLAG_HIDDEN);
     if (input) { s->raw_read=input->driver->read_cb; input->driver->read_cb=touch_read; }
+    nvs_handle_t n; int32_t page=UI_OVERVIEW;
+    if (nvs_open("echo_ui",NVS_READONLY,&n)==ESP_OK) { nvs_get_i32(n,"page",&page); nvs_close(n); }
+    if (page>=0 && page<UI_PAGE_COUNT) { ui_navigate(page); s->saved_page=page; }
     s->timer=lv_timer_create(update,250,NULL); update(NULL);
     return true;
+}
+
+bool ui_shell_control(bool page,int value) {
+    if (!s || !s->timer) return false;
+    if (page) { if (value<0 || value>=UI_PAGE_COUNT) return false; ui_navigate(value); }
+    else {
+        if (value < -1 || value>100) return false;
+        int level=value<0?(s->dimmed?10:100):value;
+        if (display_set_backlight(level)!=ESP_OK) return false;
+        s->backlight_override=value;
+    }
+    publish_status(now_us()); return true;
 }

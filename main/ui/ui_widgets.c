@@ -17,8 +17,11 @@ void ui_theme_init(void) {
     lv_style_set_bg_grad_color(&card,lv_color_hex(ECHO_CARD)); lv_style_set_bg_grad_dir(&card,LV_GRAD_DIR_VER);
     lv_style_set_bg_opa(&card,LV_OPA_COVER); lv_style_set_border_width(&card,1);
     lv_style_set_border_color(&card,lv_color_hex(ECHO_EDGE));
-    lv_style_set_shadow_color(&card,lv_color_black()); lv_style_set_shadow_width(&card,6);
-    lv_style_set_shadow_ofs_y(&card,2); lv_style_set_shadow_opa(&card,LV_OPA_20);
+    // Pronounced raised 3D look: a wider, softer drop shadow offset down so the
+    // card reads as lifted off the dark background (was width 6 / ofs 2 / opa 20).
+    lv_style_set_shadow_color(&card,lv_color_black()); lv_style_set_shadow_width(&card,16);
+    lv_style_set_shadow_ofs_y(&card,5); lv_style_set_shadow_spread(&card,1);
+    lv_style_set_shadow_opa(&card,LV_OPA_50);
     lv_style_set_radius(&card,8); lv_style_set_pad_all(&card,8); lv_style_set_pad_row(&card,4);
     lv_style_init(&text); lv_style_set_text_color(&text,lv_color_hex(ECHO_TEXT));
     lv_style_set_text_font(&text,ECHO_FONT_READ);
@@ -26,6 +29,9 @@ void ui_theme_init(void) {
     lv_style_set_bg_grad_color(&button,lv_color_hex(ECHO_CARD)); lv_style_set_bg_grad_dir(&button,LV_GRAD_DIR_VER);
     lv_style_set_border_width(&button,1); lv_style_set_border_color(&button,lv_color_hex(ECHO_EDGE));
     lv_style_set_radius(&button,6);
+    // Subtle raised shadow so buttons read as 3D/clickable (matches the cards).
+    lv_style_set_shadow_color(&button,lv_color_black()); lv_style_set_shadow_width(&button,8);
+    lv_style_set_shadow_ofs_y(&button,3); lv_style_set_shadow_opa(&button,LV_OPA_40);
     lv_style_set_pad_all(&button,0); lv_style_set_text_font(&button,ECHO_FONT_SMALL);
 }
 void ui_page_style(lv_obj_t *root) {

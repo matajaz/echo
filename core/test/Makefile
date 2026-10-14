@@ -11,7 +11,7 @@ SRC     := test_core.c
 
 .PHONY: test clean
 CJSON := ../../managed_components/espressif__cjson/cJSON
-REVIEW_DEPS := ../wav_stream.h ../chart_history.h ../input_gate.h ../ha_parse.h ../ha_model.h ../energy_model.h ../time_utils.h
+REVIEW_DEPS := ../wav_stream.h ../chart_history.h ../input_gate.h ../ha_parse.h ../ha_model.h ../reading_units.h ../energy_model.h ../time_utils.h
 
 test: $(TARGET) test_review
 	./$(TARGET)
@@ -27,4 +27,12 @@ $(TARGET): $(SRC) ../sample_model.h ../readiness.h ../ota_identity.h ../audio_cm
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
 clean:
-	rm -rf $(TARGET) $(TARGET).dSYM
+	rm -rf $(TARGET) $(TARGET).dSYM test_review test_review.dSYM test_history_cache test_history_cache.dSYM cjson_test.o
+
+test_history_cache: test_history_cache.c ../history_cache.h ../chart_history.h
+	$(CC) $(CFLAGS) -o $@ test_history_cache.c -lm
+
+test: history-cache
+history-cache: test_history_cache
+	./test_history_cache
+.PHONY: history-cache

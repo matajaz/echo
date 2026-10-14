@@ -33,6 +33,12 @@ static uint32_t s_history_request;
 static char *s_body;
 typedef struct { char *buf; size_t len; bool overflow; } http_body_t;
 static void *json_alloc(size_t n) { return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT); }
+void ha_json_init(void) {
+    // Startup calls this before registering HTTP handlers; allocation hooks must
+    // not change while requests or HA parsing are using cJSON.
+    static bool initialized;
+    if (!initialized) { cJSON_Hooks hooks={.malloc_fn=json_alloc,.free_fn=free}; cJSON_InitHooks(&hooks); initialized=true; }
+}
 static bool paused(void) { return __atomic_load_n(&s_pause_req,__ATOMIC_ACQUIRE); }
 static esp_err_t http_event(esp_http_client_event_t *e) {
     http_body_t *b=e->user_data;
@@ -154,7 +160,7 @@ esp_err_t ha_init(void) {
         return ESP_ERR_NO_MEM;
     }
     memset(s_prices,0,sizeof(*s_prices));
-    cJSON_Hooks hooks={.malloc_fn=json_alloc,.free_fn=free}; cJSON_InitHooks(&hooks);
+    ha_json_init();
     s_data.count=COUNT(k_entities); s_data.batt_count=COUNT(k_batt_entities); s_data.power_count=COUNT(k_power_entities);
     init_entries(s_data.sensors,k_entities,s_data.count,90000);
     init_entries(s_data.batteries,k_batt_entities,s_data.batt_count,900000);

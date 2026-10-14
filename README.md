@@ -1,5 +1,11 @@
 # echo
 
+## Shared maintenance update (2026-10-14)
+
+Deployment now publishes content-addressed images and verifies a new boot running the exact confirmed ELF identity. `tools/maintenance.py` implements the common client; `tools/collect_log.sh` understands boot-aware logs. Install the shared OTA server's updated nginx allowlist before using the deployment script. Startup/rollback changes require an initial USB qualification; running devices have not been changed by this source update. See `../VEGENA-ECHO-IMPLEMENTATION-2026-10-14.md` for the implementation and installation order. The older narrative below describes earlier releases where it conflicts with these notes.
+
+The versioned API includes health, metrics, OTA progress, UI state and capabilities. UI page and backlight controls use POST with `X-OTA-Key`; backlight is 0–100 percent. The last page and 24-hour sensor history survive reboot through batched NVS writes.
+
 New ESP32 project. Board was connected to the USB port previously used by
 **lumen**. Hardware identified and factory-backed-up on 2026-10-01 before any
 flashing.

@@ -81,3 +81,5 @@ esp_err_t weblog_register(httpd_handle_t server);
 #ifdef __cplusplus
 }
 #endif
+
+void weblog_stats(uint32_t *dropped,uint32_t *truncated);
