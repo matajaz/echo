@@ -33,17 +33,20 @@ void* ui_costs_create(lv_obj_t *root) {
     costs_t *s=ui_state_alloc(sizeof(*s)); if (!s) return NULL; s->history_stamp=UINT64_MAX;
     lv_obj_t *row=ui_row(root,224,30,8);
     s->today=ui_button(row,"Today",108,30,day_changed,s); s->yesterday=ui_button(row,"Yesterday",108,30,day_changed,s);
-    row=ui_row(root,224,40,4);
+    lv_obj_t *stats=ui_card(root,48); ui_card_accent(stats,ECHO_COOL);
+    row=ui_row(stats,LV_PCT(100),40,4);
     lv_obj_t *col=ui_column(row,72,40,0); ui_label(col,"Bought kr",ECHO_FONT_SMALL,ECHO_COOL); s->bought=ui_label(col,"--",ECHO_FONT_READ,ECHO_COOL);
     col=ui_column(row,72,40,0); ui_label(col,"Sold kr",ECHO_FONT_SMALL,ECHO_GREEN); s->income=ui_label(col,"--",ECHO_FONT_READ,ECHO_GREEN);
     col=ui_column(row,72,40,0); ui_label(col,"Net kr",ECHO_FONT_SMALL,ECHO_TEXT); s->net=ui_label(col,"--",ECHO_FONT_READ,ECHO_TEXT);
-    s->chart=ui_chart(root,116,LV_CHART_TYPE_BAR);
+    lv_obj_t *chartcard=ui_card(root,132); ui_card_accent(chartcard,ECHO_BLUE);
+    s->chart=ui_chart(chartcard,116,LV_CHART_TYPE_BAR);
     lv_obj_add_flag(s->chart,LV_OBJ_FLAG_CLICKABLE);lv_obj_add_event_cb(s->chart,chart_mode,LV_EVENT_CLICKED,s);
     s->cost=lv_chart_add_series(s->chart,lv_color_hex(ECHO_BLUE),LV_CHART_AXIS_PRIMARY_Y);
     s->sold=lv_chart_add_series(s->chart,lv_color_hex(ECHO_GREEN),LV_CHART_AXIS_PRIMARY_Y);
     lv_obj_add_event_cb(s->chart,labels,LV_EVENT_DRAW_PART_BEGIN,s);
-    s->status=ui_label(root,"Loading hourly costs",ECHO_FONT_SMALL,ECHO_TEXT_DIM);
-    lv_obj_set_width(s->status,224); lv_label_set_long_mode(s->status,LV_LABEL_LONG_WRAP);
+    lv_obj_t *statuscard=ui_card(root,40);
+    s->status=ui_label(statuscard,"Loading hourly costs",ECHO_FONT_SMALL,ECHO_TEXT_DIM);
+    lv_obj_set_width(s->status,LV_PCT(100)); lv_label_set_long_mode(s->status,LV_LABEL_LONG_WRAP);
     return s;
 }
 void ui_costs_enter(void *state) { costs_t *s=state; ha_history_request(s->day); }

@@ -9,11 +9,14 @@ static void axis(lv_event_t *e) {
 }
 void *ui_power_history_create(lv_obj_t *root) {
  power_history_ui_t *s=ui_state_alloc(sizeof(*s));if(!s)return NULL;history=s;s->rendered=UINT64_MAX;
- ui_label(root,"Solar / grid W - past hour",ECHO_FONT_READ,ECHO_TEXT);
- s->chart=ui_chart(root,172,LV_CHART_TYPE_LINE);lv_chart_set_point_count(s->chart,CHART_HISTORY_POINTS);
+ lv_obj_t *card=ui_card(root,206);ui_card_accent(card,ECHO_SOLAR);
+ ui_label(card,"Solar / grid W - past hour",ECHO_FONT_READ,ECHO_TEXT);
+ s->chart=ui_chart(card,172,LV_CHART_TYPE_LINE);lv_chart_set_point_count(s->chart,CHART_HISTORY_POINTS);
  s->series[0]=lv_chart_add_series(s->chart,lv_color_hex(ECHO_SOLAR),LV_CHART_AXIS_PRIMARY_Y);s->series[1]=lv_chart_add_series(s->chart,lv_color_hex(ECHO_COOL),LV_CHART_AXIS_PRIMARY_Y);
  lv_obj_add_event_cb(s->chart,axis,LV_EVENT_DRAW_PART_BEGIN,NULL);
- s->status=ui_label(root,"Yellow solar / blue grid",ECHO_FONT_SMALL,ECHO_TEXT_DIM);return s;
+ lv_obj_t *statuscard=ui_card(root,40);
+ s->status=ui_label(statuscard,"Yellow solar / blue grid",ECHO_FONT_SMALL,ECHO_TEXT_DIM);
+ lv_obj_set_width(s->status,LV_PCT(100));lv_label_set_long_mode(s->status,LV_LABEL_LONG_WRAP);return s;
 }
 void ui_power_history_record(const ui_model_t *m) {
  if(!history)return;

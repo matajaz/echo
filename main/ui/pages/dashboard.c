@@ -11,13 +11,15 @@ static void light_pressed(lv_event_t *e) {
 }
 static void *create(lv_obj_t *root,int id) {
  dashboard_ui_t *s=ui_state_alloc(sizeof(*s));if(!s)return NULL;s->id=id;
- s->age=ui_label(root,"Waiting for data",ECHO_FONT_SMALL,ECHO_TEXT_DIM);
- lv_obj_t *scroll=ui_column(root,224,206,0);lv_obj_add_flag(scroll,LV_OBJ_FLAG_SCROLLABLE);lv_obj_set_scroll_dir(scroll,LV_DIR_VER);
- s->body=ui_label(scroll,"Waiting for Home Assistant / collector",&font_montserrat_14_sv,ECHO_TEXT);lv_obj_set_width(s->body,210);lv_label_set_long_mode(s->body,LV_LABEL_LONG_WRAP);
- if(id==DASH_NETWORK){s->wan_body=ui_label(scroll,"WAN health unavailable",&font_montserrat_14_sv,ECHO_TEXT_DIM);lv_obj_set_width(s->wan_body,210);lv_label_set_long_mode(s->wan_body,LV_LABEL_LONG_WRAP);}
+ lv_obj_t *header=ui_card(root,34);ui_card_accent(header,ECHO_BLUE);
+ s->age=ui_label(header,"Waiting for data",ECHO_FONT_SMALL,ECHO_TEXT_DIM);
+ lv_obj_t *card=ui_card(root,210);
+ lv_obj_t *scroll=ui_column(card,206,192,4);lv_obj_add_flag(scroll,LV_OBJ_FLAG_SCROLLABLE);lv_obj_set_scroll_dir(scroll,LV_DIR_VER);
+ s->body=ui_label(scroll,"Waiting for Home Assistant / collector",&font_montserrat_14_sv,ECHO_TEXT);lv_obj_set_width(s->body,196);lv_label_set_long_mode(s->body,LV_LABEL_LONG_WRAP);
+ if(id==DASH_NETWORK){s->wan_body=ui_label(scroll,"WAN health unavailable",&font_montserrat_14_sv,ECHO_TEXT_DIM);lv_obj_set_width(s->wan_body,196);lv_label_set_long_mode(s->wan_body,LV_LABEL_LONG_WRAP);}
  if(id==DASH_LIGHTS)for(int i=0;i<9;i++) {
     ui_label(scroll,dashboard_light_names[i],ECHO_FONT_SMALL,ECHO_TEXT);
-    lv_obj_t *row=ui_row(scroll,210,32,6);
+    lv_obj_t *row=ui_row(scroll,196,32,6);
     ui_button(row,"On",90,30,light_pressed,(void*)(intptr_t)(i*2+1));ui_button(row,"Off",90,30,light_pressed,(void*)(intptr_t)(i*2));
  }
  return s;
