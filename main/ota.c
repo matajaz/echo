@@ -1,4 +1,5 @@
 // Pull-OTA for echo (ESP32-C5).
+#include <ctype.h>
 //
 // Pattern follows the workspace's proven lumen/Vegena approach, documented
 // in steering (esp32-lessons.md "OTA (wireless firmware update) -- PULL,
@@ -416,6 +417,20 @@ static void ota_task(void *pvParameter) {
     vTaskDelete(NULL);
 }
 
+static void ota_percent_decode(char *s) {
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (r[0] == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])) {
+            char h[3] = { r[1], r[2], 0 };
+            *w++ = (char)strtol(h, NULL, 16);
+            r += 2;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+}
+
 static esp_err_t ota_get_param(httpd_req_t *req, const char *key, char *out, size_t out_len) {
     size_t qlen = httpd_req_get_url_query_len(req) + 1;
     if (qlen <= 1) return ESP_FAIL;
@@ -428,6 +443,7 @@ static esp_err_t ota_get_param(httpd_req_t *req, const char *key, char *out, siz
         ret = httpd_query_key_value(query, key, out, out_len);
     }
     free(query);
+    if (ret == ESP_OK) ota_percent_decode(out);  // decode %XX in the value
     return ret;
 }
 
